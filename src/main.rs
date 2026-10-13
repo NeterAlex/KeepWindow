@@ -1,0 +1,20 @@
+#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
+
+#[cfg(windows)]
+mod app;
+#[cfg(windows)]
+mod mouse;
+#[cfg(windows)]
+mod protection;
+#[cfg(windows)]
+mod window;
+
+#[cfg(windows)]
+fn main() {
+    app::run();
+}
+
+#[cfg(not(windows))]
+fn main() {
+    eprintln!("KeepWindow requires Windows 10 or later.");
+}
