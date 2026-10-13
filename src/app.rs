@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use gpui_kit::{
     AppContext as _, Context, Entity, IntoElement, ParentElement as _, Render, SharedString,
     Styled as _, Window, WindowOptions,
@@ -13,9 +15,12 @@ use gpui_kit::{
     },
     div, px,
 };
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use windows::Win32::Foundation::HWND;
 
 use crate::{
     protection::{Options, Protection},
+    tray::{Action as TrayAction, Tray},
     window::{self, WindowInfo},
 };
 
@@ -30,11 +35,32 @@ pub struct KeepWindow {
     height: Entity<InputState>,
     right_offset: Entity<InputState>,
     top_offset: Entity<InputState>,
+    tray: Option<Tray>,
+    _refresh_task: gpui_kit::Task<()>,
     _quit_subscription: gpui_kit::Subscription,
 }
 
 impl KeepWindow {
     fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+        window.set_window_title("KeepWindow");
+        let tray = HasWindowHandle::window_handle(window)
+            .map_err(|error| format!("无法获取主窗口句柄：{error}"))
+            .and_then(|handle| match handle.as_raw() {
+                RawWindowHandle::Win32(handle) => Tray::new(HWND(handle.hwnd.get() as *mut _)),
+                _ => Err("主窗口不是 Windows 窗口。".into()),
+            });
+        let view = cx.weak_entity();
+        window.on_window_should_close(cx, move |_, cx| {
+            view.update(cx, |this, cx| {
+                if let Some(tray) = &this.tray {
+                    tray.hide();
+                } else {
+                    this.exit(cx);
+                }
+            })
+            .ok();
+            false
+        });
         let width = cx.new(|cx| {
             InputState::new(window, cx)
                 .placeholder("宽度")
@@ -60,6 +86,7 @@ impl KeepWindow {
                 let _ = protection.restore();
             }
             this.protections.clear();
+            this.tray.take();
             async {}
         });
         let mut this = Self {
@@ -73,9 +100,32 @@ impl KeepWindow {
             height,
             right_offset,
             top_offset,
+            tray: None,
+            _refresh_task: cx.spawn(async move |this, cx| {
+                loop {
+                    cx.background_executor()
+                        .timer(Duration::from_millis(100))
+                        .await;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.tick(cx);
+                            this.process_tray_actions(cx);
+                        })
+                        .is_err()
+                    {
+                        break;
+                    }
+                }
+            }),
             _quit_subscription: quit_subscription,
         };
         this.refresh(cx);
+        match tray {
+            Ok(tray) => {
+                this.tray = Some(tray);
+            }
+            Err(error) => this.status = error.into(),
+        }
         this
     }
 
@@ -113,8 +163,50 @@ impl KeepWindow {
                 },
             });
         if !ended.is_empty() {
-            self.status = ended.join("；").into();
             self.refresh(cx);
+            self.status = ended.join("；").into();
+        }
+    }
+
+    fn process_tray_actions(&mut self, cx: &mut Context<Self>) {
+        let actions = self
+            .tray
+            .as_ref()
+            .map(Tray::take_actions)
+            .unwrap_or_default();
+        for action in actions {
+            match action {
+                TrayAction::Show => {
+                    if let Some(tray) = &self.tray {
+                        tray.show();
+                    }
+                    self.refresh(cx);
+                }
+                TrayAction::RestoreAll => self.restore_all(cx),
+                TrayAction::Exit => {
+                    self.exit(cx);
+                    break;
+                }
+            }
+        }
+    }
+
+    fn minimize_to_tray(&mut self, cx: &mut Context<Self>) {
+        if let Some(tray) = &self.tray {
+            tray.hide();
+        } else {
+            self.status = "系统托盘不可用，主界面将保持可见。".into();
+            cx.notify();
+        }
+    }
+
+    fn exit(&mut self, cx: &mut Context<Self>) {
+        self.restore_all(cx);
+        if self.protections.is_empty() {
+            self.tray.take();
+            cx.quit();
+        } else if let Some(tray) = &self.tray {
+            tray.show();
         }
     }
 
@@ -231,9 +323,7 @@ impl KeepWindow {
 }
 
 impl Render for KeepWindow {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.tick(cx);
-        window.request_animation_frame();
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let rows = self.windows.iter().enumerate().map(|(i, item)| {
             let selected = self.selected == Some(i);
@@ -266,12 +356,13 @@ impl Render for KeepWindow {
         });
         div().size_full().v_flex().gap_3().p_5().bg(theme.background).text_color(theme.foreground).font_family("Microsoft YaHei UI")
             .child(div().v_flex().gap_1().child(div().text_2xl().child("KeepWindow")).child(div().text_sm().text_color(theme.muted_foreground).child("防止重要窗口被误点关闭")))
-            .child(div().flex().gap_2().child(Button::new("refresh").label("刷新列表").on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))).child(Button::new("restore-all").label("恢复全部").on_click(cx.listener(|this, _, _, cx| this.restore_all(cx)))))
+            .child(div().flex().gap_2().child(Button::new("refresh").label("刷新列表").on_click(cx.listener(|this, _, _, cx| this.refresh(cx)))).child(Button::new("restore-all").label("恢复全部").on_click(cx.listener(|this, _, _, cx| this.restore_all(cx)))).child(Button::new("hide").label("最小化到托盘").on_click(cx.listener(|this, _, _, cx| this.minimize_to_tray(cx)))).child(Button::new("exit").label("退出").on_click(cx.listener(|this, _, _, cx| this.exit(cx)))))
             .child(div().flex_1().min_h(px(160.)).overflow_y_scrollbar().children(rows))
             .child(div().v_flex().gap_2().child(Checkbox::new("system-menu").label("禁用系统关闭（标准标题栏）").checked(self.system_menu).on_change(cx.listener(|this, v, _, cx| { this.system_menu = *v; cx.notify(); }))).child(Checkbox::new("mouse-shield").label("鼠标遮罩（拦截单击、双击和三击）").checked(self.mouse_shield).on_change(cx.listener(|this, v, _, cx| { this.mouse_shield = *v; cx.notify(); }))))
             .child(div().flex().gap_2().children([Input::new(&self.width), Input::new(&self.height), Input::new(&self.right_offset), Input::new(&self.top_offset)]))
             .child(div().flex().gap_2().child(Button::new("protect").primary().label("开启保护").on_click(cx.listener(|this, _, _, cx| this.protect(cx)))).child(Button::new("restore").label("恢复所选窗口").on_click(cx.listener(|this, _, _, cx| this.restore_selected(cx)))))
             .child(div().rounded_md().bg(theme.secondary).p_3().text_sm().text_color(theme.muted_foreground).child("普通窗口建议启用系统保护；自绘标题栏启用鼠标遮罩。遮罩会拦截关闭按钮区域的单击和双击。"))
+            .child(div().text_sm().text_color(theme.muted_foreground).child("关闭或最小化主界面后，保护继续在后台运行。点击托盘图标返回，使用“退出”恢复保护并结束程序。"))
             .child(div().text_sm().text_color(theme.muted_foreground).child(self.status.clone()))
     }
 }
@@ -281,9 +372,31 @@ pub fn run() {
         gpui_kit::init(cx);
         crate::protection::register_overlay_class()
             .expect("failed to register shield window class");
-        gpui_kit::open_window(WindowOptions::default(), cx, |window, cx| {
+        let background = std::env::args().any(|arg| arg == "--background");
+        let options = WindowOptions {
+            show: !background,
+            focus: !background,
+            ..WindowOptions::default()
+        };
+        let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
             cx.new(|cx| KeepWindow::new(window, cx))
         })
         .expect("failed to open KeepWindow");
+        if background && view.read(cx).tray.is_none() {
+            handle
+                .update(cx, |_, window, _| {
+                    if let Ok(native) = HasWindowHandle::window_handle(window)
+                        && let RawWindowHandle::Win32(native) = native.as_raw()
+                    {
+                        unsafe {
+                            let _ = windows::Win32::UI::WindowsAndMessaging::ShowWindow(
+                                HWND(native.hwnd.get() as *mut _),
+                                windows::Win32::UI::WindowsAndMessaging::SW_SHOW,
+                            );
+                        }
+                    }
+                })
+                .ok();
+        }
     });
 }

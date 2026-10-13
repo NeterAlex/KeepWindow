@@ -7,6 +7,8 @@ mod mouse;
 #[cfg(windows)]
 mod protection;
 #[cfg(windows)]
+mod tray;
+#[cfg(windows)]
 mod window;
 
 #[cfg(windows)]

@@ -3305,6 +3305,7 @@ name = "keep-window"
 version = "0.2.0"
 dependencies = [
  "gpui-kit",
+ "raw-window-handle",
  "windows 0.62.2",
 ]
 
