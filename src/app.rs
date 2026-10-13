@@ -1,8 +1,9 @@
 use std::time::Duration;
 
 use gpui_kit::{
-    AppContext as _, Bounds, Context, Entity, IntoElement, ParentElement as _, Render,
-    SharedString, Styled as _, Window, WindowBounds, WindowOptions,
+    AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
+    ParentElement as _, Render, SharedString, StatefulInteractiveElement as _, Styled as _, Window,
+    WindowBounds, WindowOptions,
     assets::IconName,
     base::StyledExt,
     component::{
@@ -11,9 +12,13 @@ use gpui_kit::{
         button::ButtonVariants,
         checkbox::Checkbox,
         input::{Input, InputEvent, InputState, NumberInput},
+        menu::{DropdownMenu as _, PopupMenuItem},
         table::{DataTable, TableEvent, TableState},
+        tooltip::Tooltip,
     },
-    div, px, size,
+    div,
+    prelude::FluentBuilder as _,
+    px, size,
 };
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
@@ -295,15 +300,6 @@ impl KeepWindow {
         }
     }
 
-    fn minimize_to_tray(&mut self, cx: &mut Context<Self>) {
-        if let Some(tray) = &self.tray {
-            tray.hide();
-        } else {
-            self.status = "系统托盘不可用，主界面将保持可见。".into();
-            cx.notify();
-        }
-    }
-
     fn exit(&mut self, cx: &mut Context<Self>) {
         self.restore_all(cx);
         if self.protections.is_empty() {
@@ -536,101 +532,204 @@ impl Render for KeepWindow {
         self.table.update(cx, |table, cx| {
             if table
                 .delegate_mut()
-                .fit_width(window.bounds().size.width - px(50.))
+                .fit_width(window.bounds().size.width - px(34.))
             {
                 table.refresh(cx);
             }
         });
         let theme = cx.theme();
-        let compact = window.bounds().size.height < px(720.);
-        let narrow = window.bounds().size.width < px(840.);
         let selected = self.selected.as_ref();
         let protected = selected.is_some_and(|target| self.protection_for(target).is_some());
         let editable = selected.is_some() && !protected;
         let parameters_enabled = editable && self.mouse_shield;
-        let valid = self.options(cx).is_ok();
-        let can_protect = editable && (self.system_menu || self.mouse_shield) && valid;
+        let validation = self.options(cx);
+        let can_protect = editable && (self.system_menu || self.mouse_shield) && validation.is_ok();
         let count = self.table.read(cx).delegate().rows.len();
         let filtering = !self.search.read(cx).value().trim().is_empty();
         let count_label = if filtering {
-            format!("匹配 {count} / 共 {} 个窗口", self.windows.len())
+            format!("{count}/{} 个窗口", self.windows.len())
         } else {
-            format!("共找到 {} 个窗口", self.windows.len())
+            format!("{} 个窗口", self.windows.len())
         };
-        let config_hint: SharedString = if protected {
-            "当前展示生效参数；恢复后可修改。".into()
-        } else if editable && !self.system_menu && !self.mouse_shield {
-            "请选择至少一种保护方式。".into()
-        } else if parameters_enabled && !valid {
-            self.options(cx).unwrap_err()
-        } else {
-            "参数仅应用于当前所选窗口。".into()
+        let validation_error: Option<SharedString> =
+            if editable && !self.system_menu && !self.mouse_shield {
+                Some("请选择至少一种保护方式。".into())
+            } else if parameters_enabled {
+                validation.err()
+            } else {
+                None
+            };
+        let action_hint = match selected {
+            Some(target) if protected => {
+                format!("解除“{}”的保护，随后可修改参数。", target.display_title())
+            }
+            Some(target) => format!("将当前设置应用于“{}”。", target.display_title()),
+            None => "请先在表格中选择一个窗口。".into(),
         };
+        let view = cx.entity();
         let fields = [
-            ("宽度", &self.width, "1–512"),
-            ("高度", &self.height, "1–512"),
-            ("右侧内缩", &self.right_offset, "−512–512"),
-            ("顶部下移", &self.top_offset, "−512–512"),
+            ("width-field", "宽度", &self.width, "遮罩宽度：1–512 DIP。"),
+            (
+                "height-field",
+                "高度",
+                &self.height,
+                "遮罩高度：1–512 DIP。",
+            ),
+            (
+                "right-field",
+                "右侧内缩",
+                &self.right_offset,
+                "右侧内缩：−512–512 DIP。正值向左，负值向右。",
+            ),
+            (
+                "top-field",
+                "顶部下移",
+                &self.top_offset,
+                "顶部下移：−512–512 DIP。正值向下，负值向上。",
+            ),
         ]
         .into_iter()
-        .map(|(label, state, range)| {
+        .map(|(id, label, state, hint)| {
             div()
+                .id(id)
                 .flex_1()
                 .min_w_0()
-                .v_flex()
-                .gap_1p5()
+                .flex()
+                .items_center()
+                .gap_2()
+                .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+                .child(div().text_sm().flex_shrink_0().child(label))
                 .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .text_xs()
-                        .child(label)
-                        .child(div().text_color(theme.muted_foreground).child(range)),
+                    div().flex_1().min_w_0().child(
+                        NumberInput::new(state)
+                            .small()
+                            .h(px(30.))
+                            .disabled(!parameters_enabled),
+                    ),
                 )
-                .child(NumberInput::new(state).disabled(!parameters_enabled))
         });
-        div().size_full().v_flex().bg(theme.background).text_color(theme.foreground).font_family(theme.font_family.clone())
+
+        let toolbar = div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .flex_shrink_0()
+            .child(div().flex_1().min_w_0().max_w(px(440.)).child(
+                Input::new(&self.search)
+                    .h(px(32.))
+                    .prefix(Icon::new(IconName::Search).small())
+                    .cleanable(true),
+            ))
+            .child(div().flex_1())
+            .child(Button::new("hint").ghost().icon(IconName::Lightbulb).accessibility_label("保护使用提示").tooltip("标准标题栏可使用系统关闭保护；自绘标题栏可开启鼠标遮罩。关闭或最小化主界面后，保护继续运行。通过托盘返回，退出时恢复全部窗口。"))
+            .child(Button::new("refresh").ghost().icon(IconName::RefreshCw).label("刷新").tooltip("重新读取窗口列表").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
+            .child(Button::new("more").ghost().icon(IconName::Ellipsis).label("更多").dropdown_caret(false).dropdown_menu(move |menu, window, cx| {
+                let restore_disabled = view.read(cx).protections.is_empty();
+                menu.item(PopupMenuItem::new("恢复全部窗口").icon(IconName::RotateCcw).disabled(restore_disabled)
+                    .on_click(window.listener_for(&view, |this, _, _, cx| this.restore_all(cx))))
+                    .separator()
+                    .item(PopupMenuItem::new("退出并恢复").icon(IconName::LogOut)
+                        .on_click(window.listener_for(&view, |this, _, _, cx| this.exit(cx))))
+            }));
+
+        let config = div()
+            .v_flex()
+            .gap_2()
+            .p_3()
+            .flex_shrink_0()
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.table)
             .child(
-                div().flex().items_center().justify_between().gap_4().px_6().py_4().flex_shrink_0()
-                    .child(div().flex().items_center().gap_3()
-                        .child(div().size(px(38.)).rounded(px(12.)).bg(theme.primary).text_color(theme.primary_foreground).flex().items_center().justify_center().child(Icon::new(IconName::ShieldCheck).size(px(22.))))
-                        .child(div().font_family("Segoe UI Variable Display").text_xl().font_semibold().child("KeepWindow")))
-                    .child(div().flex().items_center().gap_1p5()
-                        .child(Button::new("hint").ghost().small().icon(IconName::Lightbulb).accessibility_label("保护使用提示").tooltip("标准标题栏可使用系统关闭保护；自绘标题栏可开启鼠标遮罩。收起或关闭主界面后，保护继续运行。"))
-                        .child(Button::new("refresh").ghost().small().icon(IconName::RefreshCw).label("刷新").tooltip("重新读取窗口列表").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
-                        .child(Button::new("restore-all").ghost().small().icon(IconName::RotateCcw).label("恢复全部").disabled(self.protections.is_empty()).on_click(cx.listener(|this, _, _, cx| this.restore_all(cx))))
-                        .child(Button::new("hide").ghost().small().icon(IconName::Minimize2).label(if narrow { "收起" } else { "收起到托盘" }).tooltip("隐藏主界面，保护继续在后台运行").on_click(cx.listener(|this, _, _, cx| this.minimize_to_tray(cx))))
-                        .child(div().w(px(1.)).h_5().mx_1().bg(theme.border))
-                        .child(Button::new("exit").ghost().small().icon(IconName::LogOut).label("退出").tooltip("恢复全部窗口并退出 KeepWindow").on_click(cx.listener(|this, _, _, cx| this.exit(cx)))))
+                div().flex().items_center().justify_between().gap_3()
+                    .child(div().flex().items_center().gap_5()
+                        .child(div().id("system-help").tooltip(|window, cx| Tooltip::new("禁用标准标题栏和系统菜单的关闭命令。已保护窗口需先解除保护才能修改。" ).build(window, cx)).child(
+                            Checkbox::new("system-menu").label("系统关闭保护").checked(self.system_menu).disabled(!editable)
+                                .on_change(cx.listener(|this, value, _, cx| { this.system_menu = *value; cx.notify(); }))))
+                        .child(div().id("shield-help").tooltip(|window, cx| Tooltip::new("拦截关闭按钮区域的鼠标点击，适用于自绘标题栏。已保护窗口需先解除保护才能修改。" ).build(window, cx)).child(
+                            Checkbox::new("mouse-shield").label("鼠标遮罩").checked(self.mouse_shield).disabled(!editable)
+                                .on_change(cx.listener(|this, value, _, cx| { this.mouse_shield = *value; cx.notify(); })))))
+                    .child(Button::new("toggle-protection").primary()
+                        .icon(if protected { IconName::RotateCcw } else { IconName::ShieldCheck })
+                        .label(if protected { "解除保护" } else { "开启保护" })
+                        .tooltip(action_hint).disabled(!protected && !can_protect)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let protected = this.selected.as_ref().is_some_and(|target| this.protection_for(target).is_some());
+                            if protected { this.restore_selected(cx); } else { this.protect(cx); }
+                        })))
+            )
+            .when(self.mouse_shield, |config| config.child(
+                div().flex().items_center().gap_2().children(fields)
+                    .child(div().id("dip-help").text_xs().text_color(theme.muted_foreground).flex_shrink_0()
+                        .tooltip(|window, cx| Tooltip::new("DIP 是逻辑像素，实际遮罩像素按目标窗口的 DPI 缩放。" ).build(window, cx)).child("DIP")),
+            ))
+            .when_some(validation_error, |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)));
+
+        div()
+            .size_full()
+            .v_flex()
+            .bg(theme.background)
+            .text_color(theme.foreground)
+            .font_family(theme.font_family.clone())
+            .child(
+                div()
+                    .flex_1()
+                    .min_h_0()
+                    .v_flex()
+                    .gap_3()
+                    .p_4()
+                    .child(toolbar)
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_h(px(110.))
+                            .rounded(px(8.))
+                            .border_1()
+                            .border_color(theme.border)
+                            .bg(theme.table)
+                            .overflow_hidden()
+                            .child(
+                                DataTable::new(&self.table)
+                                    .bordered(false)
+                                    .with_size(px(32.))
+                                    .header_row_height(px(30.)),
+                            ),
+                    )
+                    .child(config),
             )
             .child(
-                div().flex_1().min_h_0().v_flex().gap_4().px_6().pb_4()
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .h(px(28.))
+                    .px_4()
+                    .flex_shrink_0()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .bg(theme.table)
+                    .text_xs()
+                    .text_color(theme.muted_foreground)
                     .child(
-                        div().flex_1().min_h(px(110.)).v_flex().rounded(px(12.)).border_1().border_color(theme.border).bg(theme.table).overflow_hidden()
-                            .child(div().flex().items_center().justify_between().gap_4().px_4().py_3().flex_shrink_0()
-                                .child(div().flex().items_center().gap_2().child(div().text_sm().font_semibold().child("窗口列表")).child(div().text_xs().text_color(theme.muted_foreground).child(format!("{count} 个"))))
-                                .child(div().w(px(if narrow { 280. } else { 320. })).child(Input::new(&self.search).small().prefix(Icon::new(IconName::Search).small()).cleanable(true))))
-                            .child(div().flex_1().min_h_0().child(DataTable::new(&self.table).bordered(false).with_size(px(if compact { 32. } else { 36. })).header_row_height(px(34.)))))
+                        div()
+                            .flex_shrink_0()
+                            .child(format!("{count_label} · {} 个保护", self.protections.len())),
+                    )
                     .child(
-                        div().v_flex().gap_3().p_4().flex_shrink_0().rounded(px(12.)).border_1().border_color(theme.border).bg(theme.table)
-                            .child(div().flex().items_center().gap_6()
-                                .child(Checkbox::new("system-menu").label("禁用系统关闭").checked(self.system_menu).disabled(!editable).on_change(cx.listener(|this, v, _, cx| { this.system_menu = *v; cx.notify(); })))
-                                .child(Checkbox::new("mouse-shield").label("鼠标遮罩").checked(self.mouse_shield).disabled(!editable).on_change(cx.listener(|this, v, _, cx| { this.mouse_shield = *v; cx.notify(); })))
-                                .child(div().text_xs().text_color(theme.muted_foreground).child(if self.mouse_shield { "拦截关闭按钮区域的鼠标点击" } else { "适用于标准标题栏" })))
-                            .child(div().v_flex().gap_2()
-                                .child(div().flex().items_center().gap_2().text_xs().child("遮罩尺寸与位置").child(div().text_color(theme.muted_foreground).child("DIP · 随目标窗口缩放")))
-                                .child(div().flex().gap_3().children(fields)))
-                            .child(div().flex().items_center().justify_between().gap_4()
-                                .child(div().flex_1().min_w_0().text_xs().text_color(if editable && (!valid || (!self.system_menu && !self.mouse_shield)) { theme.danger } else { theme.muted_foreground }).child(config_hint))
-                                .child(div().flex().gap_2()
-                                    .child(Button::new("restore").outline().icon(IconName::RotateCcw).label("恢复所选窗口").disabled(!protected).on_click(cx.listener(|this, _, _, cx| this.restore_selected(cx))))
-                                    .child(Button::new("protect").primary().icon(IconName::ShieldCheck).label(if protected { "已开启保护" } else { "开启保护" }).disabled(!can_protect).on_click(cx.listener(|this, _, _, cx| this.protect(cx)))))))
+                        div()
+                            .id("operation-status")
+                            .flex_1()
+                            .min_w_0()
+                            .text_right()
+                            .truncate()
+                            .child(self.status.clone())
+                            .tooltip({
+                                let status = self.status.clone();
+                                move |window, cx| Tooltip::new(status.clone()).build(window, cx)
+                            }),
+                    ),
             )
-            .child(
-                div().v_flex().gap_1().px_6().py_2().flex_shrink_0().border_t_1().border_color(theme.border).bg(theme.table)
-                    .child(div().flex().items_center().justify_between().text_xs()
-                        .child(div().flex().items_center().gap_3().text_color(theme.muted_foreground).child(count_label).child(div().w(px(1.)).h_3().bg(theme.border)).child(format!("正在保护 {} 个窗口", self.protections.len())))
-                        .child(div().flex_1().min_w_0().text_right().truncate().text_color(theme.muted_foreground).child(self.status.clone()))))
     }
 }
 
@@ -648,10 +747,10 @@ pub fn run() {
                 focus: !background,
                 window_bounds: Some(WindowBounds::Windowed(Bounds::centered(
                     None,
-                    size(px(920.), px(780.)),
+                    size(px(860.), px(620.)),
                     cx,
                 ))),
-                window_min_size: Some(size(px(740.), px(620.))),
+                window_min_size: Some(size(px(740.), px(420.))),
                 ..WindowOptions::default()
             };
             let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {

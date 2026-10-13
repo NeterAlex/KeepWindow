@@ -187,10 +187,19 @@ impl TableDelegate for WindowTable {
                 .into_any_element(),
             _ => {
                 let description = row.protection.unwrap_or("尚未开启保护");
+                let status = if row.protection.is_some() {
+                    protection_tag(true, cx).into_any_element()
+                } else {
+                    div()
+                        .text_xs()
+                        .text_color(theme.muted_foreground)
+                        .child("未保护")
+                        .into_any_element()
+                };
                 cell.child(
                     div()
                         .id(("protection-tag", row_ix))
-                        .child(protection_tag(row.protection.is_some(), cx))
+                        .child(status)
                         .tooltip(move |window, cx| Tooltip::new(description).build(window, cx)),
                 )
                 .into_any_element()
