@@ -9,6 +9,8 @@ mod protection;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]
+mod ui;
+#[cfg(windows)]
 mod window;
 
 #[cfg(windows)]
