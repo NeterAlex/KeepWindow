@@ -1,4 +1,9 @@
-use std::{cell::RefCell, collections::VecDeque, mem::size_of, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::VecDeque,
+    mem::size_of,
+    rc::Rc,
+};
 
 use windows::{
     Win32::{
@@ -6,7 +11,7 @@ use windows::{
         UI::{
             Shell::{
                 DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-                NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
+                NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
                 RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW,
             },
             WindowsAndMessaging::*,
@@ -14,6 +19,8 @@ use windows::{
     },
     core::w,
 };
+
+use crate::icon::WindowIcons;
 
 const TRAY_MESSAGE: u32 = WM_APP + 41;
 const HIDE_MESSAGE: u32 = WM_APP + 42;
@@ -32,7 +39,8 @@ pub enum Action {
 }
 
 struct State {
-    data: NOTIFYICONDATAW,
+    data: Cell<NOTIFYICONDATAW>,
+    icons: RefCell<WindowIcons>,
     taskbar_created: u32,
     actions: RefCell<VecDeque<Action>>,
 }
@@ -40,17 +48,30 @@ struct State {
 impl State {
     fn add_icon(&self) -> bool {
         unsafe {
-            if !Shell_NotifyIconW(NIM_ADD, &self.data).as_bool() {
+            let data = self.data.get();
+            if !Shell_NotifyIconW(NIM_ADD, &data).as_bool() {
                 return false;
             }
-            let mut version = self.data;
+            let mut version = data;
             version.Anonymous.uVersion = NOTIFYICON_VERSION_4;
             if !Shell_NotifyIconW(NIM_SETVERSION, &version).as_bool() {
-                let _ = Shell_NotifyIconW(NIM_DELETE, &self.data);
+                let _ = Shell_NotifyIconW(NIM_DELETE, &data);
                 return false;
             }
         }
         true
+    }
+
+    fn update_icons(&self, dpi: u32) {
+        let mut icons = self.icons.borrow_mut();
+        if icons.update_dpi(dpi).is_ok() {
+            let mut data = self.data.get();
+            data.hIcon = icons.small();
+            self.data.set(data);
+            unsafe {
+                let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+            }
+        }
     }
 
     fn queue(&self, action: Action) {
@@ -79,18 +100,11 @@ impl State {
                 AppendMenuW(menu, MF_STRING, EXIT_COMMAND, w!("退出并恢复保护"))?;
                 let mut cursor = POINT::default();
                 GetCursorPos(&mut cursor)?;
-                let _ = SetForegroundWindow(self.data.hWnd);
-                let _ = TrackPopupMenu(
-                    menu,
-                    TPM_RIGHTBUTTON,
-                    cursor.x,
-                    cursor.y,
-                    None,
-                    self.data.hWnd,
-                    None,
-                );
+                let hwnd = self.data.get().hWnd;
+                let _ = SetForegroundWindow(hwnd);
+                let _ = TrackPopupMenu(menu, TPM_RIGHTBUTTON, cursor.x, cursor.y, None, hwnd, None);
                 // Complete the popup's foreground ownership so clicking elsewhere dismisses it.
-                let _ = PostMessageW(Some(self.data.hWnd), WM_NULL, WPARAM(0), LPARAM(0));
+                let _ = PostMessageW(Some(hwnd), WM_NULL, WPARAM(0), LPARAM(0));
                 Ok(())
             })();
             let _ = result;
@@ -105,20 +119,21 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(hwnd: HWND) -> Result<Self, String> {
-        let icon = make_icon().map_err(|error| format!("无法创建托盘图标：{error}"))?;
+        let icons = WindowIcons::new(hwnd).map_err(|error| format!("无法加载应用图标：{error}"))?;
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
             uID: TRAY_ID,
             uFlags: NIF_MESSAGE | NIF_ICON | NIF_TIP | NIF_SHOWTIP,
             uCallbackMessage: TRAY_MESSAGE,
-            hIcon: icon,
+            hIcon: icons.small(),
             ..Default::default()
         };
         let tooltip = crate::window::wide("KeepWindow - 后台窗口保护");
         data.szTip[..tooltip.len()].copy_from_slice(&tooltip);
         let state = Rc::new(State {
-            data,
+            data: Cell::new(data),
+            icons: RefCell::new(icons),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
             actions: RefCell::new(VecDeque::new()),
         });
@@ -131,7 +146,6 @@ impl Tray {
             )
             .as_bool()
             {
-                let _ = DestroyIcon(icon);
                 return Err("无法安装主窗口托盘处理。".into());
             }
         }
@@ -144,13 +158,13 @@ impl Tray {
 
     pub fn hide(&self) {
         unsafe {
-            let _ = ShowWindow(self.state.data.hWnd, SW_HIDE);
+            let _ = ShowWindow(self.state.data.get().hWnd, SW_HIDE);
         }
     }
 
     pub fn show(&self) {
         unsafe {
-            let hwnd = self.state.data.hWnd;
+            let hwnd = self.state.data.get().hWnd;
             let command = if IsIconic(hwnd).as_bool() {
                 SW_RESTORE
             } else {
@@ -169,9 +183,9 @@ impl Tray {
 impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
-            let _ = RemoveWindowSubclass(self.state.data.hWnd, Some(tray_proc), SUBCLASS_ID);
-            let _ = Shell_NotifyIconW(NIM_DELETE, &self.state.data);
-            let _ = DestroyIcon(self.state.data.hIcon);
+            let data = self.state.data.get();
+            let _ = RemoveWindowSubclass(data.hWnd, Some(tray_proc), SUBCLASS_ID);
+            let _ = Shell_NotifyIconW(NIM_DELETE, &data);
         }
     }
 }
@@ -197,6 +211,10 @@ unsafe extern "system" fn tray_proc(
             return LRESULT(0);
         }
         match message {
+            WM_DPICHANGED => {
+                state.update_icons((wparam.0 & 0xFFFF) as u32);
+                DefSubclassProc(hwnd, message, wparam, lparam)
+            }
             WM_CLOSE | HIDE_MESSAGE => {
                 let _ = ShowWindow(hwnd, SW_HIDE);
                 LRESULT(0)
@@ -225,43 +243,6 @@ unsafe extern "system" fn tray_proc(
             }
             _ => DefSubclassProc(hwnd, message, wparam, lparam),
         }
-    }
-}
-
-fn make_icon() -> windows::core::Result<HICON> {
-    // A small green shield drawn as icon pixels keeps the executable self-contained.
-    const SIZE: usize = 32;
-    let mut mask = [0xFFu8; SIZE * SIZE / 8];
-    let mut pixels = [0u8; SIZE * SIZE * 4];
-    for y in 3..29 {
-        for x in 0..SIZE {
-            let half_width = if y < 17 { 12 } else { 12 - (y - 17) };
-            if (x as i32 - 16).unsigned_abs() as usize > half_width {
-                continue;
-            }
-            mask[y * SIZE / 8 + x / 8] &= !(0x80 >> (x % 8));
-            let index = (y * SIZE + x) * 4;
-            let check =
-                ((10..=16).contains(&x) && y == x + 3) || ((16..=23).contains(&x) && y == 35 - x);
-            let color = if check {
-                [255, 255, 255]
-            } else {
-                [73, 151, 36]
-            };
-            pixels[index..index + 3].copy_from_slice(&color);
-            pixels[index + 3] = 255;
-        }
-    }
-    unsafe {
-        CreateIcon(
-            None,
-            SIZE as i32,
-            SIZE as i32,
-            1,
-            32,
-            mask.as_ptr(),
-            pixels.as_ptr(),
-        )
     }
 }
 
@@ -299,7 +280,20 @@ mod tests {
                 },
             )
             .unwrap();
+            let original_icons = [ICON_SMALL, ICON_BIG]
+                .map(|kind| SendMessageW(hwnd, WM_GETICON, Some(WPARAM(kind as usize)), None));
             let tray = Tray::new(hwnd).unwrap();
+            for kind in [ICON_SMALL, ICON_BIG] {
+                assert_ne!(
+                    SendMessageW(hwnd, WM_GETICON, Some(WPARAM(kind as usize)), None).0,
+                    0
+                );
+            }
+            tray.state.update_icons(144);
+            assert_eq!(
+                SendMessageW(hwnd, WM_GETICON, Some(WPARAM(ICON_SMALL as usize)), None).0,
+                tray.state.data.get().hIcon.0 as isize
+            );
             SendMessageW(hwnd, WM_CLOSE, None, None);
             assert!(IsWindow(Some(hwnd)).as_bool());
             assert!(!IsWindowVisible(hwnd).as_bool());
@@ -328,6 +322,12 @@ mod tests {
             assert_eq!(tray.take_actions(), vec![Action::RestoreAll, Action::Exit]);
             protection.restore().unwrap();
             drop(tray);
+            for (kind, original) in [ICON_SMALL, ICON_BIG].into_iter().zip(original_icons) {
+                assert_eq!(
+                    SendMessageW(hwnd, WM_GETICON, Some(WPARAM(kind as usize)), None),
+                    original
+                );
+            }
             SendMessageW(hwnd, WM_CLOSE, None, None);
             assert!(!IsWindow(Some(hwnd)).as_bool());
         }

@@ -3,6 +3,8 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod icon;
+#[cfg(windows)]
 mod mouse;
 #[cfg(windows)]
 mod protection;

@@ -1,0 +1,20 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <defs>
+    <linearGradient id="tile" x1="32" y1="24" x2="228" y2="240" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#424744"/>
+      <stop offset="1" stop-color="#202523"/>
+    </linearGradient>
+    <linearGradient id="shield" x1="153" y1="114" x2="204" y2="205" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#8ecb85"/>
+      <stop offset="1" stop-color="#439557"/>
+    </linearGradient>
+  </defs>
+  <rect x="16" y="16" width="224" height="224" rx="52" fill="url(#tile)"/>
+  <rect x="17" y="17" width="222" height="222" rx="51" fill="none" stroke="#ffffff" stroke-opacity=".1" stroke-width="2"/>
+  <rect x="48" y="59" width="154" height="128" rx="13" fill="#f5f6f1"/>
+  <path d="M56 92H194V174A5 5 0 0 1 189 179H61A5 5 0 0 1 56 174Z" fill="#303733"/>
+  <circle cx="65" cy="76" r="4" fill="#828d84"/>
+  <circle cx="79" cy="76" r="4" fill="#828d84"/>
+  <path d="M132 126L176 108L220 126V158C220 183 202 201 176 213C150 201 132 183 132 158Z" fill="url(#shield)" stroke="#282e2a" stroke-width="8" stroke-linejoin="round"/>
+  <path d="M156 158L171 173L196 145" fill="none" stroke="#ffffff" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+</svg>
