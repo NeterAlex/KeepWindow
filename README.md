@@ -5,6 +5,12 @@
 
 KeepWindow 是一个 Windows 窗口防误关闭工具。它可以禁用标准关闭命令，或用鼠标遮罩保护自绘标题栏的关闭按钮。
 
+<p align="center">
+  <a href="assets/main_window_screenshot.png">
+    <img src="assets/main_window_screenshot.png" alt="KeepWindow 主界面：窗口列表、保护状态与遮罩参数设置" width="900">
+  </a>
+</p>
+
 ## 功能
 
 - 系统关闭保护：禁用目标窗口系统菜单中的“关闭”项。
