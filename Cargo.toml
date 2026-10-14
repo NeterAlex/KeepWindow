@@ -29,7 +29,9 @@ windows = { version = "0.62.2", features = [
 winresource = "0.1.34"
 
 [profile.release]
-lto = true
-codegen-units = 1
+# Thin LTO keeps cross-crate optimization while avoiding the slowest full-LTO link.
+lto = "thin"
+# More units let rustc codegen run in parallel; the binary remains fully optimized.
+codegen-units = 16
 strip = true
 panic = "abort"

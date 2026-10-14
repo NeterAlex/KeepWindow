@@ -1,26 +1,53 @@
 # KeepWindow
 
-Windows 窗口防误关闭工具。为选定窗口禁用系统关闭操作，或用鼠标遮罩覆盖关闭按钮，减少工作时的误触。
+[![CI](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml)
+[![Latest release](https://img.shields.io/github/v/release/NeterAlex/KeepWindow?display_name=tag&sort=semver)](https://github.com/NeterAlex/KeepWindow/releases)
+
+KeepWindow 是一个 Windows 窗口防误关闭工具。它可以禁用标准关闭命令，或用鼠标遮罩保护自绘标题栏的关闭按钮。
 
 ## 功能
 
-- **系统关闭保护**：禁用目标窗口系统菜单中的“关闭”项，适用于采用标准关闭处理的程序。
-- **鼠标遮罩**：拦截关闭按钮区域的单击和双击，支持手动调整尺寸、偏移及 DPI 缩放。
-- **窗口搜索**：按名称、窗口类名、PID 或窗口句柄筛选，分别管理多个窗口的保护状态。
-- **后台驻留**：关闭或最小化主界面后继续保护，通过系统托盘返回界面或退出。
-- **一键恢复**：解除单个或全部窗口的保护，正常退出时恢复已修改的关闭状态。
-- **应用规则**：保存保护方式及遮罩参数，按程序路径、窗口类名和可选标题关键词匹配，支持逐条启用自动保护。
-- **实时校准**：拖动遮罩调整位置、通过右下角调整大小，支持保护中应用新参数和设置透明度。
-- **状态与单实例**：分别显示实际生效的系统保护、鼠标保护及恢复失败状态；重复启动唤起已有实例。
+- 系统关闭保护：禁用目标窗口系统菜单中的“关闭”项。
+- 鼠标遮罩：拦截关闭按钮区域的单击和双击，支持 DPI 缩放、移动和调整大小。
+- 应用规则：按程序路径、窗口类名和可选标题关键词保存设置，可为新窗口自动保护。
+- 后台驻留：关闭或最小化主界面后继续保护，通过系统托盘返回或退出并恢复。
+- 状态与恢复：显示实际生效的保护方式，支持单个或全部恢复，并保留恢复失败项供重试。
 
-## 构建与运行
+## 安装
 
-运行环境：Windows 10 1703 或更新版本，x64。
+从 [Releases](https://github.com/NeterAlex/KeepWindow/releases) 下载最新的 Windows x64 压缩包，解压后运行 `keep-window.exe`。
 
-从源码构建需要：
+运行要求：Windows 10 1703 或更新版本，x64。目标程序以管理员身份运行时，KeepWindow 也可能需要以管理员身份运行。
 
-- Rust 稳定版，使用 `x86_64-pc-windows-msvc` 工具链。
-- Visual Studio Build Tools 的“使用 C++ 的桌面开发”组件及 Windows SDK。
+## 使用
+
+1. 打开目标程序，在列表中选择窗口。
+2. 标准标题栏使用“系统关闭保护”；自绘标题栏使用“鼠标遮罩”，也可以同时启用。
+3. 点击“开启保护”。使用鼠标遮罩时，确认半透明区域覆盖关闭按钮；必要时点击“校准遮罩”调整位置和大小。
+4. 使用“应用设置”修改已保护窗口，或点击“解除保护”恢复窗口。
+
+关闭、最小化主界面或按 `Alt+F4` 会隐藏 KeepWindow，保护继续运行。也可以直接启动到后台：
+
+```powershell
+.\keep-window.exe --background
+```
+
+## 应用规则
+
+选中窗口并设置参数后，点击“保存为应用规则”。规则匹配完整程序路径（不区分大小写）和窗口类名（精确匹配）；填写“标题包含”后按不区分大小写的关键词匹配。自动保护默认关闭，多条规则命中时，带标题条件的规则优先。
+
+规则保存在 `%LOCALAPPDATA%\KeepWindow\config.json`，跨运行生效。可在“更多 → 应用规则管理”中编辑、启用、禁用或删除规则。
+
+## 保护范围
+
+- 系统关闭保护依赖目标程序遵守 Windows 系统菜单状态；自绘标题栏可能绕过它。
+- 鼠标遮罩只拦截覆盖区域内的鼠标点击，并且仅在目标窗口可见且位于前台时显示。
+- `Alt+F4`、程序自己的“退出”命令、自定义快捷键、直接发送关闭消息或结束进程不受鼠标遮罩保护。
+- 强制结束 KeepWindow 可能留下被禁用的系统关闭项；重启目标程序通常可以恢复。
+
+## 从源码构建
+
+需要 Rust stable MSVC 工具链、Visual Studio Build Tools 的“使用 C++ 的桌面开发”组件和 Windows SDK。
 
 ```powershell
 git clone https://github.com/NeterAlex/KeepWindow.git
@@ -29,100 +56,16 @@ cargo build --release
 .\target\release\keep-window.exe
 ```
 
-图标和版本信息自动嵌入 EXE，无需单独分发图标文件。
-
-## 使用方法
-
-1. 打开目标程序，在 KeepWindow 中选择窗口。列表每秒自动更新，也可点击“刷新”。
-2. 对标准标题栏启用“系统关闭保护”；对自绘标题栏启用“鼠标遮罩”。两种方式可以组合使用，没有系统菜单的窗口使用鼠标遮罩。
-3. 点击“开启保护”。使用遮罩时，切换到目标窗口，确认绿色半透明区域覆盖关闭按钮。
-4. 点击“解除保护”恢复所选窗口，或通过“更多 → 恢复全部窗口”批量恢复。
-
-遮罩默认宽 46、高 32 DIP，按目标窗口 DPI 换算为实际像素。“右侧内缩”和“顶部下移”的正值向窗口内部移动，负值反向移动。调整已保护窗口的参数后点击“应用设置”，无需先解除保护。透明度范围为 5%–80%，默认 28%。
-
-点击“校准遮罩”后，拖动蓝色框移动位置，拖动右下角调整大小，点击保存或按 Enter 确认，点击取消或按 Esc 还原。目标最小化、关闭或切换到其他应用时自动取消。校准已保护窗口时系统保护继续生效，鼠标拦截跟随校准框，校准框与控制按钮允许正常操作。
-
-### 应用规则与自动保护
-
-选中窗口后，设置保护方式及参数，点击“保存为应用规则”。规则按程序完整路径和窗口类名匹配；“标题包含”留空时匹配所有同类窗口，填写时按不区分大小写的关键词匹配。程序路径匹配忽略大小写，窗口类名精确匹配；规则不保存 PID 或窗口句柄。
-
-“自动保护新窗口”默认关闭。启用并保存后，启动时已有窗口以及后续新窗口会自动开启保护。多条启用规则命中时，带标题条件的规则优先，同级按规则列表顺序匹配。规则编辑只影响后续保护，已保护窗口需要点击“应用设置”；保存校准结果时同步更新匹配规则。
-
-通过“更多 → 应用规则管理”编辑、启用、禁用或删除规则。手动解除或恢复全部后，当前窗口在本次存活期间不会被重新自动保护，新建窗口仍按规则处理。自动保护失败时只提示一次，可选中窗口点击“开启保护 / 重试”；修改规则后允许重新尝试。隐藏的已保护窗口仍保留在管理列表中。
-
-配置保存于 `%LOCALAPPDATA%\KeepWindow\config.json`，使用版本化 JSON 和同目录临时文件替换。损坏、无法读取或版本不支持的配置保留原文件并停止规则加载和保存；修复或移走原文件后重新启动。无法获取程序路径的窗口仍可手动保护，但不能创建规则。
-
-状态标签反映实际生效的保护组件，鼠标保护仍需确认覆盖位置。恢复失败时保留可重试项，并在详情中显示剩余保护及错误原因。
-
-### 后台运行与退出
-
-关闭、最小化主界面或按 Alt+F4 会隐藏 KeepWindow，保护继续运行。点击系统托盘图标可返回界面；图标可能位于托盘折叠菜单中。
-
-直接启动到后台：
-
-```powershell
-.\target\release\keep-window.exe --background
-```
-
-通过“更多 → 退出并恢复”或托盘菜单“退出并恢复保护”结束程序。恢复失败时，主界面会显示错误并保留相关窗口，便于重试。
-
-应用规则跨运行保存；`--background` 加载并执行已启用的自动规则，但不设置开机自启。重复启动会唤起已有实例，重复 `--background` 启动直接退出。强制结束进程可能留下禁用的系统关闭项，此时重启目标程序可恢复。
-
-## 保护范围
-
-| 关闭途径 | 系统关闭保护 | 鼠标遮罩 |
-| --- | --- | --- |
-| 标准标题栏关闭按钮 / 系统菜单“关闭” | 适用于标准关闭处理 | 仅拦截遮罩区域内的鼠标点击 |
-| 自绘标题栏关闭按钮 | 取决于程序是否遵守系统菜单状态 | 遮罩覆盖按钮时可拦截点击 |
-| Alt+F4 | 取决于目标程序的关闭处理 | 不拦截键盘 |
-| 程序菜单“退出”、自定义快捷键 | 可绕过保护 | 不保护 |
-| 直接发送关闭消息、程序自行退出、结束进程 | 不保护 | 不保护 |
-
-Windows Terminal 等自绘标题栏程序的关闭按钮可以绕过系统菜单禁用状态，建议使用鼠标遮罩，并检查实际覆盖位置。遮罩仅在目标窗口位于前台且可见时显示。
-
-目标程序以管理员身份运行时，KeepWindow 也可能需要以管理员身份运行。
-
-## 开发与贡献
-
-项目使用 Rust、GPUI Kit 和 windows-rs。提交改动前，请在 Windows 上运行：
+日常开发可使用 `cargo check`。提交前建议运行：
 
 ```powershell
 cargo fmt --check
-cargo test --locked --all-targets --all-features -- --test-threads=1
 cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo build --locked --release --all-features
+cargo test --locked --all-targets --all-features -- --test-threads=1
 ```
-
-测试覆盖配置保存与损坏文件保留、规则匹配、保护实时更新与恢复、鼠标拦截、单实例、自动保护重启与手动解除，以及托盘生命周期。涉及第三方程序或 DPI 的改动，请补充实际应用中的验证结果。
-
-图标源文件位于 [`assets/`](assets/)。修改 SVG 后，使用 [uv](https://docs.astral.sh/uv/) 重新生成图标：
-
-```powershell
-uv run scripts/generate_icon.py
-```
-
-欢迎通过 [Issues](https://github.com/NeterAlex/KeepWindow/issues) 报告问题，或提交 Pull Request。兼容性问题请附上 Windows 版本、目标应用及版本、显示缩放比例、保护方式和复现步骤。
-
-## GitHub Actions
-
-- **CI**：推送到 `main`、提交 Pull Request 或手动触发时，检查格式，并在 Windows Server 2022 的 x64 MSVC 环境中运行 Clippy、串行测试和 Release 构建。测试操作原生窗口及鼠标钩子，需使用 `--test-threads=1`。
-- **构建产物**：通过检查后，上传 `keep-window-windows-x64` artifact，保留 14 天。其中包含携带 EXE、README 和许可证的 ZIP 包，以及对应的 SHA-256 校验文件。
-- **Release**：推送与 `Cargo.toml` 版本一致的 `v*` 标签时，复用全部 CI 检查，并将 ZIP 和校验文件发布到 GitHub Releases。带预发布后缀的版本自动标记为 prerelease。
-- **依赖维护**：Dependabot 每周检查 Rust 依赖和 GitHub Actions 更新。Actions 固定到完整提交 SHA；普通检查只授予读取权限，发布任务单独授予写入权限。
-
-例如，当前 `Cargo.toml` 版本为 `0.3.0` 时，可用以下命令触发发布：
-
-```powershell
-git tag v0.3.0
-git push origin v0.3.0
-```
-
-发布流程使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需额外配置发布密钥。
-
-## 致谢
-
-交互思路参考 [PettterWang/NOCLOSE](https://github.com/PettterWang/NOCLOSE)。
 
 ## 许可证
 
 [MIT License](LICENSE)
+
+交互思路参考 [PettterWang/NOCLOSE](https://github.com/PettterWang/NOCLOSE)。
