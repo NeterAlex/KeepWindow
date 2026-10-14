@@ -3,6 +3,8 @@
 [![CI](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/NeterAlex/KeepWindow?display_name=tag&sort=semver)](https://github.com/NeterAlex/KeepWindow/releases)
 
+项目主页：[neteralex.github.io/KeepWindow](https://neteralex.github.io/KeepWindow/)
+
 KeepWindow 是一个 Windows 窗口防误关闭工具。它可以禁用标准关闭命令，或用鼠标遮罩保护自绘标题栏的关闭按钮。
 
 <p align="center">
