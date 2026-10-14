@@ -1,0 +1,106 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+  workflow_call:
+    outputs:
+      package-version:
+        description: Version of the checked and packaged application
+        value: ${{ jobs.windows.outputs.package-version }}
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_BACKTRACE: '1'
+
+jobs:
+  format:
+    name: Formatting
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --no-self-update
+          rustup default stable
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  windows:
+    name: Windows x64
+    needs: format
+    runs-on: windows-2022
+    timeout-minutes: 60
+    outputs:
+      package-version: ${{ steps.package.outputs.version }}
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Check out source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          persist-credentials: false
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable-x86_64-pc-windows-msvc --profile minimal --component clippy --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup default stable-x86_64-pc-windows-msvc
+
+      - name: Restore Rust cache
+        uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        with:
+          save-if: ${{ github.event_name == 'push' && github.ref == 'refs/heads/main' }}
+
+      - name: Check Clippy
+        run: cargo clippy --locked --all-targets --all-features -- -D warnings
+
+      # These tests share native window classes, hooks, and desktop state.
+      - name: Run tests
+        run: cargo test --locked --all-targets --all-features -- --test-threads=1
+
+      - name: Build release
+        run: cargo build --locked --release --all-features
+
+      - name: Package application
+        id: package
+        run: |
+          $metadataJson = cargo metadata --locked --no-deps --format-version 1
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $metadata = $metadataJson | ConvertFrom-Json
+          $package = $metadata.packages | Where-Object { $_.name -eq 'keep-window' }
+          $version = $package.version
+          if (-not $version) { throw 'Could not determine the application version.' }
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+          New-Item -ItemType Directory -Path dist -Force | Out-Null
+          $archive = "KeepWindow-v$version-windows-x64.zip"
+          Compress-Archive -Path target/release/keep-window.exe, README.md, LICENSE -DestinationPath "dist/$archive" -Force
+          $digest = (Get-FileHash -LiteralPath "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
+          "$digest  $archive`n" | Set-Content -LiteralPath "dist/$archive.sha256" -Encoding ascii -NoNewline
+
+      - name: Upload application
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6
+        with:
+          name: keep-window-windows-x64
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0

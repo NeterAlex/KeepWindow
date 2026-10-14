@@ -449,6 +449,10 @@ mod tests {
             return;
         }
 
+        let options = Options {
+            mouse_shield: false,
+            ..Options::default()
+        };
         let title = format!("KeepWindow foreign test {}", std::process::id());
         let mut child = TestProcess(Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "protection::tests::native_menu_works_across_processes_and_direct_close_bypasses_it"])
@@ -471,7 +475,7 @@ mod tests {
         let info = WindowInfo::inspect(target).unwrap();
         assert_ne!(info.pid, std::process::id());
         let menu = unsafe { GetSystemMenu(target, false) };
-        let mut guard = Protection::start(info.clone(), Options::default()).unwrap();
+        let mut guard = Protection::start(info.clone(), options).unwrap();
         unsafe {
             assert_ne!(GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) & MF_GRAYED.0, 0);
         }
@@ -482,7 +486,7 @@ mod tests {
                 0
             );
         }
-        let guard = Protection::start(info, Options::default()).unwrap();
+        let guard = Protection::start(info, options).unwrap();
         unsafe {
             PostMessageW(Some(target), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
         }
@@ -519,6 +523,10 @@ mod tests {
 
     #[test]
     fn native_menu_restores_previous_state_and_survives_destroyed_target() {
+        let options = Options {
+            mouse_shield: false,
+            ..Options::default()
+        };
         unsafe {
             let target = CreateWindowExW(
                 WINDOW_EX_STYLE(0),
@@ -537,7 +545,7 @@ mod tests {
             .unwrap();
             let menu = GetSystemMenu(target, false);
             let info = WindowInfo::inspect(target).unwrap();
-            let mut guard = Protection::start(info.clone(), Options::default()).unwrap();
+            let mut guard = Protection::start(info.clone(), options).unwrap();
             assert_ne!(GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) & MF_GRAYED.0, 0);
             // Reapply protection when an application re-enables its Close item.
             let _ = EnableMenuItem(menu, SC_CLOSE, MF_BYCOMMAND | MF_ENABLED);
@@ -549,10 +557,10 @@ mod tests {
                 0
             );
             let _ = EnableMenuItem(menu, SC_CLOSE, MF_BYCOMMAND | MF_GRAYED);
-            let mut guard = Protection::start(info.clone(), Options::default()).unwrap();
+            let mut guard = Protection::start(info.clone(), options).unwrap();
             guard.restore().unwrap();
             assert_ne!(GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) & MF_GRAYED.0, 0);
-            let guard = Protection::start(info, Options::default()).unwrap();
+            let guard = Protection::start(info, options).unwrap();
             DestroyWindow(target).unwrap();
             assert!(!guard.alive());
             drop(guard);

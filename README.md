@@ -71,9 +71,9 @@ Windows Terminal 等自绘标题栏程序的关闭按钮可以绕过系统菜单
 
 ```powershell
 cargo fmt --check
-cargo test
-cargo clippy --all-targets -- -D warnings
-cargo build --release
+cargo test --locked --all-targets --all-features -- --test-threads=1
+cargo clippy --locked --all-targets --all-features -- -D warnings
+cargo build --locked --release --all-features
 ```
 
 测试覆盖窗口选择与搜索、保护状态恢复、鼠标拦截及托盘生命周期。涉及第三方程序或 DPI 的改动，请补充实际应用中的验证结果。
@@ -85,6 +85,22 @@ uv run scripts/generate_icon.py
 ```
 
 欢迎通过 [Issues](https://github.com/NeterAlex/KeepWindow/issues) 报告问题，或提交 Pull Request。兼容性问题请附上 Windows 版本、目标应用及版本、显示缩放比例、保护方式和复现步骤。
+
+## GitHub Actions
+
+- **CI**：推送到 `main`、提交 Pull Request 或手动触发时，检查格式，并在 Windows Server 2022 的 x64 MSVC 环境中运行 Clippy、串行测试和 Release 构建。测试操作原生窗口及鼠标钩子，需使用 `--test-threads=1`。
+- **构建产物**：通过检查后，上传 `keep-window-windows-x64` artifact，保留 14 天。其中包含携带 EXE、README 和许可证的 ZIP 包，以及对应的 SHA-256 校验文件。
+- **Release**：推送与 `Cargo.toml` 版本一致的 `v*` 标签时，复用全部 CI 检查，并将 ZIP 和校验文件发布到 GitHub Releases。带预发布后缀的版本自动标记为 prerelease。
+- **依赖维护**：Dependabot 每周检查 Rust 依赖和 GitHub Actions 更新。Actions 固定到完整提交 SHA；普通检查只授予读取权限，发布任务单独授予写入权限。
+
+例如，当前 `Cargo.toml` 版本为 `0.2.0` 时，可用以下命令触发发布：
+
+```powershell
+git tag v0.2.0
+git push origin v0.2.0
+```
+
+发布流程使用 GitHub 自动提供的 `GITHUB_TOKEN`，无需额外配置发布密钥。
 
 ## 致谢
 

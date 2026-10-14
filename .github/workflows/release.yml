@@ -1,0 +1,60 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  checks:
+    name: Validate and build
+    # Keep the supported local syntax while actionlint lacks support for $/.
+    uses: ./.github/workflows/ci.yml # zizmor: ignore[self-repository]
+
+  publish:
+    name: Publish GitHub release
+    needs: checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write # Required to create the release and upload its assets.
+    steps:
+      - name: Validate version tag
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PACKAGE_VERSION: ${{ needs.checks.outputs.package-version }}
+        run: |
+          if [[ "$RELEASE_TAG" != "v$PACKAGE_VERSION" ]]; then
+            echo "Tag $RELEASE_TAG does not match Cargo.toml version v$PACKAGE_VERSION." >&2
+            exit 1
+          fi
+
+      - name: Download checked application
+        uses: actions/download-artifact@37930b1c2abaa49bbe596cd826c3c89aef350131 # v7
+        with:
+          name: keep-window-windows-x64
+          path: dist
+
+      - name: Verify archive checksum
+        working-directory: dist
+        run: sha256sum --check --strict ./*.sha256
+
+      - name: Create release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ github.ref_name }}
+          PACKAGE_VERSION: ${{ needs.checks.outputs.package-version }}
+        run: |
+          flags=()
+          if [[ "$PACKAGE_VERSION" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/*.zip dist/*.sha256 \
+            --verify-tag --generate-notes --title "KeepWindow $RELEASE_TAG" "${flags[@]}"
