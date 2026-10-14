@@ -1,15 +1,8 @@
-use std::{fs, io::Write, path::PathBuf};
+use std::{fs, path::PathBuf};
 
 use serde::{Deserialize, Serialize};
-use windows::{
-    Win32::Storage::FileSystem::{MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH, MoveFileExW},
-    core::PCWSTR,
-};
 
-use crate::{
-    protection::Options,
-    window::{WindowInfo, wide},
-};
+use crate::{protection::Options, storage::atomic_write, window::WindowInfo};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Rule {
@@ -41,13 +34,16 @@ impl Rule {
 pub struct Config {
     pub version: u32,
     pub rules: Vec<Rule>,
+    #[serde(default)]
+    pub startup_enabled: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            version: 1,
+            version: 2,
             rules: Vec::new(),
+            startup_enabled: false,
         }
     }
 }
@@ -80,7 +76,7 @@ impl Config {
     }
 
     fn validate(&self) -> Result<(), String> {
-        if self.version != 1 {
+        if self.version != 2 {
             return Err(format!(
                 "不支持的配置版本：{}。原文件未修改。",
                 self.version
@@ -117,7 +113,16 @@ impl Store {
             Some(path) => match fs::read(path) {
                 Ok(bytes) => serde_json::from_slice::<Config>(&bytes)
                     .map_err(|e| format!("配置读取失败：{e}。原文件未修改。"))
-                    .and_then(|config| {
+                    .and_then(|mut config| {
+                        if config.version == 1 {
+                            config.version = 2;
+                            config.startup_enabled = false;
+                            config.validate()?;
+                            atomic_write(
+                                path,
+                                &serde_json::to_vec_pretty(&config).map_err(|e| e.to_string())?,
+                            )?;
+                        }
                         config.validate()?;
                         Ok(config)
                     }),
@@ -151,31 +156,8 @@ impl Store {
         }
         config.validate()?;
         let path = self.path.as_ref().ok_or("配置目录不可用。")?;
-        let parent = path.parent().ok_or("配置目录不可用。")?;
-        fs::create_dir_all(parent).map_err(|e| format!("无法创建配置目录：{e}"))?;
-        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
-        let result = (|| -> Result<(), String> {
-            let bytes = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
-            let mut file = fs::File::create(&temporary).map_err(|e| e.to_string())?;
-            file.write_all(&bytes)
-                .and_then(|_| file.sync_all())
-                .map_err(|e| e.to_string())?;
-            drop(file);
-            let source = wide(&temporary.to_string_lossy());
-            let destination = wide(&path.to_string_lossy());
-            unsafe {
-                MoveFileExW(
-                    PCWSTR(source.as_ptr()),
-                    PCWSTR(destination.as_ptr()),
-                    MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-                )
-            }
-            .map_err(|e| format!("配置保存失败：{e}"))
-        })();
-        if result.is_err() {
-            let _ = fs::remove_file(temporary);
-        }
-        result
+        let bytes = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
+        atomic_write(path, &bytes)
     }
 }
 
@@ -265,5 +247,34 @@ mod tests {
         }
         fs::remove_file(&path).unwrap();
         fs::remove_dir(&directory).unwrap();
+    }
+
+    #[test]
+    fn version_one_migration_preserves_rules_and_disables_startup() {
+        let directory =
+            std::env::temp_dir().join(format!("keep-window-migration-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let path = directory.join("config.json");
+        let rules = vec![rule("Report")];
+        fs::write(
+            &path,
+            serde_json::to_vec(&serde_json::json!({"version": 1, "rules": rules})).unwrap(),
+        )
+        .unwrap();
+        let (_, migrated, error) = Store::load_path(Some(path.clone()));
+        assert!(error.is_none());
+        assert_eq!(migrated.version, 2);
+        assert_eq!(migrated.rules, rules);
+        assert!(!migrated.startup_enabled);
+        let saved: Config = serde_json::from_slice(&fs::read(&path).unwrap()).unwrap();
+        assert_eq!(saved.version, 2);
+        assert_eq!(saved.rules, rules);
+        assert!(
+            !serde_json::from_str::<Config>("{\"version\":2,\"rules\":[]}")
+                .unwrap()
+                .startup_enabled
+        );
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
     }
 }

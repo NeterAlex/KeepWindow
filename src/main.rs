@@ -13,7 +13,15 @@ mod instance;
 #[cfg(windows)]
 mod mouse;
 #[cfg(windows)]
+mod picker;
+#[cfg(windows)]
 mod protection;
+#[cfg(windows)]
+mod recovery;
+#[cfg(windows)]
+mod startup;
+#[cfg(windows)]
+mod storage;
 #[cfg(windows)]
 mod tray;
 #[cfg(windows)]

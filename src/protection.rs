@@ -23,6 +23,7 @@ use windows::{
 
 use crate::{
     mouse::MouseRegistration,
+    recovery::{Identity, Recovery},
     window::{WindowInfo, is_cloaked, valid_rect, wide},
 };
 
@@ -122,6 +123,8 @@ pub struct Protection {
     pub target: WindowInfo,
     pub options: Options,
     menu: Option<MenuProtection>,
+    recovery: Recovery,
+    pending: Option<Identity>,
     overlay: Option<HWND>,
     mouse: Option<MouseRegistration>,
     marker: Vec<u16>,
@@ -131,7 +134,16 @@ pub struct Protection {
 }
 
 impl Protection {
+    #[cfg(test)]
     pub fn start(target: WindowInfo, options: Options) -> Result<Self, String> {
+        Self::start_logged(target, options, Recovery::testing())
+    }
+
+    pub fn start_logged(
+        target: WindowInfo,
+        options: Options,
+        recovery: Recovery,
+    ) -> Result<Self, String> {
         options.validate()?;
         if !target.is_same_window() {
             return Err("目标窗口已关闭，请刷新窗口列表。".into());
@@ -149,6 +161,8 @@ impl Protection {
             target,
             options,
             menu: None,
+            recovery,
+            pending: None,
             overlay: None,
             mouse: None,
             marker,
@@ -166,7 +180,7 @@ impl Protection {
             let has_close = !menu.0.is_null()
                 && unsafe { GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) } != u32::MAX;
             if has_close || !options.mouse_shield {
-                protection.menu = Some(disable_close(protection.target.hwnd)?);
+                protection.disable_close()?;
             } else {
                 protection.error = Some("目标没有标准关闭项，仅鼠标保护生效。".into());
             }
@@ -250,13 +264,12 @@ impl Protection {
             .map_err(|e| format!("无法更新遮罩透明度：{e}"))?;
         }
         let result = (|| {
-            let mut new_menu = None;
             if options.system_menu && self.menu.is_none() {
                 let menu = unsafe { GetSystemMenu(self.target.hwnd, false) };
                 let has_close = !menu.0.is_null()
                     && unsafe { GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) } != u32::MAX;
                 if has_close || !options.mouse_shield {
-                    new_menu = Some(disable_close(self.target.hwnd)?);
+                    self.disable_close()?;
                 }
             }
             if !options.system_menu
@@ -264,13 +277,14 @@ impl Protection {
             {
                 set_close_state(self.target.hwnd, menu.menu, menu.original_disabled)?;
                 self.menu = None;
-            }
-            if new_menu.is_some() {
-                self.menu = new_menu;
+                self.clear_record()?;
             }
             Ok::<(), String>(())
         })();
         if let Err(error) = result {
+            if self.pending.is_some() && self.menu.is_none() {
+                self.recovery_failed = true;
+            }
             drop(new_mouse);
             if let Some(overlay) = new_overlay {
                 unsafe {
@@ -389,6 +403,7 @@ impl Protection {
         }
         if !self.alive() {
             self.menu = None;
+            self.clear_record()?;
             self.recovery_failed = false;
             return Ok(());
         }
@@ -406,10 +421,52 @@ impl Protection {
             }
             self.menu = None;
         }
+        if let Err(error) = self.clear_record() {
+            self.recovery_failed = true;
+            self.error = Some(error.clone());
+            return Err(error);
+        }
         unsafe {
             let _ = RemovePropW(self.target.hwnd, PCWSTR(self.marker.as_ptr()));
         }
         self.recovery_failed = false;
+        Ok(())
+    }
+
+    fn clear_record(&mut self) -> Result<(), String> {
+        if let Some(identity) = &self.pending {
+            self.recovery.remove(identity)?;
+            self.pending = None;
+        }
+        Ok(())
+    }
+
+    fn disable_close(&mut self) -> Result<(), String> {
+        let menu = unsafe { GetSystemMenu(self.target.hwnd, false) };
+        let original_disabled = original_close_state(self.target.hwnd)?;
+        let identity = self
+            .recovery
+            .record(&self.target, original_disabled, &self.marker)?;
+        self.pending = Some(identity.clone());
+        if !self.alive()
+            || !Identity::capture(&self.target).is_ok_and(|current| identity.matches(&current))
+        {
+            self.clear_record()?;
+            return Err("目标窗口已关闭或重建，请重新选择。".into());
+        }
+        self.menu = Some(MenuProtection {
+            menu,
+            original_disabled: MENU_ITEM_FLAGS(original_disabled),
+        });
+        if let Err(error) = set_close_state(self.target.hwnd, menu, MF_GRAYED) {
+            if set_close_state(self.target.hwnd, menu, MENU_ITEM_FLAGS(original_disabled)).is_ok() {
+                self.menu = None;
+                self.clear_record()?;
+            } else {
+                self.recovery_failed = true;
+            }
+            return Err(error);
+        }
         Ok(())
     }
 }
@@ -420,7 +477,7 @@ impl Drop for Protection {
     }
 }
 
-fn disable_close(hwnd: HWND) -> Result<MenuProtection, String> {
+pub fn original_close_state(hwnd: HWND) -> Result<u32, String> {
     unsafe {
         let menu = GetSystemMenu(hwnd, false);
         let state = if menu.0.is_null() {
@@ -431,16 +488,17 @@ fn disable_close(hwnd: HWND) -> Result<MenuProtection, String> {
         if state == u32::MAX {
             return Err("目标没有标准系统关闭命令。请取消“禁用系统关闭”，启用“鼠标遮罩”。".into());
         }
-        let original_disabled = MENU_ITEM_FLAGS(state & (MF_DISABLED.0 | MF_GRAYED.0));
-        if let Err(error) = set_close_state(hwnd, menu, MF_GRAYED) {
-            let _ = set_close_state(hwnd, menu, original_disabled);
-            return Err(error);
-        }
-        Ok(MenuProtection {
-            menu,
-            original_disabled,
-        })
+        Ok(state & (MF_DISABLED.0 | MF_GRAYED.0))
     }
+}
+
+pub fn restore_close_state(hwnd: HWND, state: u32) -> Result<(), String> {
+    original_close_state(hwnd)?;
+    set_close_state(
+        hwnd,
+        unsafe { GetSystemMenu(hwnd, false) },
+        MENU_ITEM_FLAGS(state),
+    )
 }
 
 fn set_close_state(hwnd: HWND, menu: HMENU, state: MENU_ITEM_FLAGS) -> Result<(), String> {

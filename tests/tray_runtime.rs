@@ -151,5 +151,8 @@ fn background_app_handles_tray_minimize_close_restore_and_exit_without_rendering
         exit.is_some()
     });
     assert!(exit.unwrap().success());
+    assert!(!profile.join("KeepWindow/running").exists());
+    assert!(!profile.join("KeepWindow/recovery.json").exists());
+    std::fs::remove_dir(profile.join("KeepWindow")).unwrap();
     std::fs::remove_dir(profile).unwrap();
 }

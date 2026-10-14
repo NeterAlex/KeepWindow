@@ -29,7 +29,9 @@ use windows::Win32::Foundation::HWND;
 use crate::{
     calibration::{Calibration, Outcome},
     config::{Config, Rule, Store},
+    picker::Picker,
     protection::{Options, Protection},
+    recovery::Recovery,
     tray::{Action as TrayAction, Tray},
     ui::{self, WindowRow, WindowTable},
     window::{self, WindowInfo},
@@ -54,6 +56,8 @@ pub struct KeepWindow {
     automatic: bool,
     config: Config,
     store: Store,
+    recovery: Recovery,
+    startup_enabled: bool,
     config_error: Option<String>,
     rules_open: bool,
     editing_rule: Option<usize>,
@@ -63,6 +67,7 @@ pub struct KeepWindow {
     last_scan: Instant,
     exiting: bool,
     calibration: Option<Calibration>,
+    picker: Option<Picker>,
     tray: Option<Tray>,
     _refresh_task: gpui_kit::Task<()>,
     _quit_subscription: gpui_kit::Subscription,
@@ -94,7 +99,12 @@ impl From<Options> for Draft {
 }
 
 impl KeepWindow {
-    fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
+    fn new(
+        window: &mut Window,
+        cx: &mut Context<Self>,
+        recovery: Recovery,
+        recovery_message: Option<String>,
+    ) -> Self {
         window.set_window_title("KeepWindow");
         let tray = HasWindowHandle::window_handle(window)
             .map_err(|error| format!("无法获取主窗口句柄：{error}"))
@@ -170,6 +180,7 @@ impl KeepWindow {
                 &table,
                 window,
                 |this, table, event, window, cx| match event {
+                    _ if this.picker.is_some() => {}
                     TableEvent::SelectRow(index) => {
                         if table.read(cx).selected_row() != Some(*index) {
                             return;
@@ -225,10 +236,12 @@ impl KeepWindow {
             }));
         }
         let quit_subscription = cx.on_app_quit(|this, _cx| {
+            this.picker.take();
             for protection in &mut this.protections {
                 let _ = protection.restore();
             }
             this.protections.clear();
+            let _ = this.recovery.finish();
             this.tray.take();
             async {}
         });
@@ -251,6 +264,8 @@ impl KeepWindow {
             automatic: false,
             config,
             store,
+            recovery,
+            startup_enabled: false,
             config_error,
             rules_open: false,
             editing_rule: None,
@@ -260,6 +275,7 @@ impl KeepWindow {
             last_scan: Instant::now(),
             exiting: false,
             calibration: None,
+            picker: None,
             tray: None,
             _refresh_task: cx.spawn_in(window, async move |this, cx| {
                 loop {
@@ -268,6 +284,7 @@ impl KeepWindow {
                         .await;
                     if this
                         .update_in(cx, |this, window, cx| {
+                            this.tick_picker(window, cx);
                             this.tick_calibration(window, cx);
                             this.tick(cx);
                             if this.last_scan.elapsed() >= Duration::from_secs(1) {
@@ -291,8 +308,22 @@ impl KeepWindow {
             Err(error) => this.status = error.into(),
         }
         this.scan(cx);
+        let mut messages = Vec::new();
+        if let Some(message) = recovery_message {
+            messages.push(message);
+        }
+        match crate::startup::enabled() {
+            Ok(enabled) => this.startup_enabled = enabled,
+            Err(error) => messages.push(error),
+        }
         if let Some(error) = &this.config_error {
-            this.status = error.clone().into();
+            messages.push(error.clone());
+        }
+        if !messages.is_empty() {
+            this.status = messages.join("；").into();
+            if let Some(tray) = &this.tray {
+                tray.notify(&this.status);
+            }
         }
         this
     }
@@ -404,12 +435,19 @@ impl KeepWindow {
 
     fn exit(&mut self, cx: &mut Context<Self>) {
         self.exiting = true;
+        self.picker.take();
         self.calibration.take();
         for protection in &mut self.protections {
             protection.set_calibration(None);
         }
         self.restore_all(cx);
         if self.protections.is_empty() {
+            if let Err(error) = self.recovery.finish() {
+                self.status = error.into();
+                if let Some(tray) = &self.tray {
+                    tray.notify(&self.status);
+                }
+            }
             self.tray.take();
             cx.quit();
         } else if let Some(tray) = &self.tray {
@@ -630,13 +668,15 @@ impl KeepWindow {
             .retain(|(item, _, _)| !item.same_identity(&target));
         self.save_draft(cx);
         match self.options(cx) {
-            Ok(options) => match Protection::start(target.clone(), options) {
-                Ok(p) => {
-                    self.protections.push(p);
-                    self.status = format!("已保护“{}”。", target.display_title()).into();
+            Ok(options) => {
+                match Protection::start_logged(target.clone(), options, self.recovery.clone()) {
+                    Ok(p) => {
+                        self.protections.push(p);
+                        self.status = format!("已保护“{}”。", target.display_title()).into();
+                    }
+                    Err(e) => self.status = e.into(),
                 }
-                Err(e) => self.status = e.into(),
-            },
+            }
             Err(e) => self.status = e,
         }
         self.rebuild_table(cx);
@@ -697,6 +737,9 @@ impl KeepWindow {
     }
 
     fn auto_protect(&mut self) {
+        if self.picker.is_some() {
+            return;
+        }
         for target in self.windows.clone() {
             if self.protection_for(&target).is_some()
                 || self
@@ -722,7 +765,7 @@ impl KeepWindow {
             }
             self.attempts
                 .retain(|(item, _, _)| !item.same_identity(&target));
-            match Protection::start(target.clone(), rule.options) {
+            match Protection::start_logged(target.clone(), rule.options, self.recovery.clone()) {
                 Ok(protection) => {
                     self.protections.push(protection);
                     self.attempts.push((target, rule, None));
@@ -838,6 +881,9 @@ impl KeepWindow {
     }
 
     fn start_calibration(&mut self, cx: &mut Context<Self>) {
+        if self.picker.is_some() {
+            return;
+        }
         let result = self.options(cx).and_then(|options| {
             let target = self.selected.clone().ok_or("请先选择窗口。")?;
             if self
@@ -863,6 +909,96 @@ impl KeepWindow {
             }
             Err(error) => self.status = error,
         }
+        cx.notify();
+    }
+
+    fn start_picker(&mut self, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.calibration.is_some() {
+            return;
+        }
+        match Picker::new() {
+            Ok(picker) => {
+                self.picker = Some(picker);
+                for protection in &mut self.protections {
+                    protection.set_calibration(Some(HWND::default()));
+                }
+                self.status = "移动准星到目标窗口，单击选择；Esc 取消。".into();
+            }
+            Err(error) => self.status = error.into(),
+        }
+        cx.notify();
+    }
+
+    fn tick_picker(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(picker) = &mut self.picker else {
+            return;
+        };
+        let outcome = picker.tick();
+        if matches!(outcome, Ok(None)) {
+            return;
+        }
+        self.picker.take();
+        for protection in &mut self.protections {
+            protection.set_calibration(None);
+        }
+        match outcome {
+            Ok(Some(Some(target))) => {
+                // Suppress automatic rules for this target until the user explicitly protects it.
+                self.suppressed.push(target.clone());
+                self.search
+                    .update(cx, |state, cx| state.set_value("", window, cx));
+                self.rules_open = false;
+                self.scan(cx);
+                if target.is_same_window() {
+                    if !self.windows.iter().any(|item| item.same_identity(&target)) {
+                        self.windows.push(target.clone());
+                    }
+                    self.select_window(target.clone(), window, cx);
+                    if self.editing_rule.is_none() {
+                        self.title_contains.update(cx, |state, cx| {
+                            state.set_value(target.title.clone(), window, cx)
+                        });
+                    }
+                    self.rebuild_table(cx);
+                    self.status =
+                        format!("已选择“{}”，请确认参数后开启保护。", target.display_title())
+                            .into();
+                } else {
+                    self.status = "目标窗口已关闭，请重新选择。".into();
+                }
+            }
+            Ok(_) => self.status = "已取消窗口选择。".into(),
+            Err(error) => self.status = error.into(),
+        }
+        self.rebuild_table(cx);
+        cx.notify();
+    }
+
+    fn toggle_startup(&mut self, cx: &mut Context<Self>) {
+        let enabled = !self.startup_enabled;
+        let result = crate::startup::set_enabled(enabled).and_then(|previous| {
+            let mut config = self.config.clone();
+            config.startup_enabled = enabled;
+            if let Err(error) = self.store.save(&config) {
+                return Err(match crate::startup::restore(previous.as_deref()) {
+                    Ok(()) => error,
+                    Err(rollback) => format!("{error}；恢复开机启动设置失败：{rollback}"),
+                });
+            }
+            self.config = config;
+            self.startup_enabled = enabled;
+            Ok(())
+        });
+        self.status = match result {
+            Ok(()) if enabled => "已开启当前用户开机启动，登录后在后台运行。".into(),
+            Ok(()) => "已关闭开机启动。".into(),
+            Err(error) => {
+                if let Ok(enabled) = crate::startup::enabled() {
+                    self.startup_enabled = enabled;
+                }
+                error.into()
+            }
+        };
         cx.notify();
     }
 
@@ -959,8 +1095,9 @@ impl Render for KeepWindow {
             self.protection_for(target)
                 .is_some_and(|p| p.recovery_failed)
         });
-        let editable =
-            (selected.is_some() || self.editing_rule.is_some()) && self.calibration.is_none();
+        let editable = (selected.is_some() || self.editing_rule.is_some())
+            && self.calibration.is_none()
+            && self.picker.is_none();
         let parameters_enabled = editable && self.mouse_shield;
         let validation = self.options(cx);
         let can_protect = selected.is_some()
@@ -989,6 +1126,20 @@ impl Render for KeepWindow {
             Some(target) => format!("将当前设置应用于“{}”。", target.display_title()),
             None => "请先在表格中选择一个窗口。".into(),
         };
+        let identity_label = self
+            .editing_rule
+            .and_then(|index| self.config.rules.get(index))
+            .map(|rule| format!("程序：{}  ·  类名：{}", rule.path, rule.class))
+            .or_else(|| {
+                selected.map(|target| {
+                    format!(
+                        "程序：{}  ·  类名：{}",
+                        self.path_for(target)
+                            .unwrap_or("无法读取，请检查目标窗口权限"),
+                        target.class
+                    )
+                })
+            });
         let view = cx.entity();
         let fields = [
             ("width-field", "宽度", &self.width, "遮罩宽度：1–512 DIP。"),
@@ -1040,17 +1191,20 @@ impl Render for KeepWindow {
             .child(div().flex_1().min_w_0().max_w(px(440.)).child(
                 Input::new(&self.search)
                     .h(px(32.))
+                    .disabled(self.picker.is_some())
                     .prefix(Icon::new(IconName::Search).small())
                     .cleanable(true),
             ))
             .child(div().flex_1())
             .child(Button::new("hint").ghost().icon(IconName::Lightbulb).accessibility_label("保护使用提示").tooltip("标准标题栏可使用系统关闭保护；自绘标题栏可开启鼠标遮罩。关闭或最小化主界面后，保护继续运行。通过托盘返回，退出时恢复全部窗口。"))
-            .child(Button::new("refresh").ghost().icon(IconName::RefreshCw).label("刷新").tooltip("重新读取窗口列表").on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
-            .child(Button::new("more").ghost().icon(IconName::Ellipsis).label("更多").dropdown_caret(false).dropdown_menu(move |menu, window, cx| {
+            .child(Button::new("refresh").ghost().icon(IconName::RefreshCw).label("刷新").tooltip("重新读取窗口列表").disabled(self.picker.is_some()).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
+            .child(Button::new("pick-window").ghost().icon(IconName::Crosshair).label("选择窗口").tooltip("移动准星到目标窗口，单击选择；Esc 取消").disabled(self.picker.is_some() || self.calibration.is_some()).on_click(cx.listener(|this, _, _, cx| this.start_picker(cx))))
+            .child(Button::new("more").ghost().icon(IconName::Ellipsis).label("更多").disabled(self.picker.is_some()).dropdown_caret(false).dropdown_menu(move |menu, window, cx| {
                 let restore_disabled = view.read(cx).protections.is_empty();
                 menu.item(PopupMenuItem::new("恢复全部窗口").icon(IconName::RotateCcw).disabled(restore_disabled)
                     .on_click(window.listener_for(&view, |this, _, _, cx| this.restore_all(cx))))
                     .item(PopupMenuItem::new("应用规则管理").on_click(window.listener_for(&view, |this, _, _, cx| { this.rules_open = !this.rules_open; cx.notify(); })))
+                    .item(PopupMenuItem::new("开机启动（后台运行）").checked(view.read(cx).startup_enabled).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_startup(cx))))
                     .separator()
                     .item(PopupMenuItem::new("退出并恢复").icon(IconName::LogOut)
                         .on_click(window.listener_for(&view, |this, _, _, cx| this.exit(cx))))
@@ -1065,6 +1219,7 @@ impl Render for KeepWindow {
             .border_1()
             .border_color(theme.border)
             .bg(theme.table)
+            .when_some(identity_label, |config, label| config.child(div().id("target-identity").text_xs().text_color(theme.muted_foreground).truncate().child(label.clone()).tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))))
             .child(
                 div().flex().items_center().justify_between().gap_3()
                     .child(div().flex().items_center().gap_5()
@@ -1078,7 +1233,7 @@ impl Render for KeepWindow {
                     .child(Button::new("toggle-protection").primary()
                         .icon(if protected { IconName::RotateCcw } else { IconName::ShieldCheck })
                         .label(if selected.is_some_and(|target| self.protection_for(target).is_some_and(|p| p.recovery_failed)) { "重试恢复" } else if protected { "解除保护" } else { "开启保护 / 重试" })
-                        .tooltip(action_hint).disabled(self.calibration.is_some() || (!protected && !can_protect))
+                        .tooltip(action_hint).disabled(self.calibration.is_some() || self.picker.is_some() || (!protected && !can_protect))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let protected = this.selected.as_ref().is_some_and(|target| this.protection_for(target).is_some());
                             if protected { this.restore_selected(cx); } else { this.protect(cx); }
@@ -1250,26 +1405,21 @@ pub fn run() {
         Ok(Some(instance)) => instance,
         Ok(None) => return,
         Err(error) => {
-            unsafe {
-                let text = window::wide(&error);
-                windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
-                    None,
-                    windows::core::PCWSTR(text.as_ptr()),
-                    windows::core::w!("KeepWindow"),
-                    windows::Win32::UI::WindowsAndMessaging::MB_OK
-                        | windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
-                );
-            }
+            report_startup_error(background, &error);
             return;
         }
     };
+    let (recovery, recovery_message) = Recovery::begin();
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
         .run(move |cx| {
             gpui_kit::init(cx);
             ui::init_theme(cx);
-            crate::protection::register_overlay_class()
-                .expect("failed to register shield window class");
+            if let Err(error) = crate::protection::register_overlay_class() {
+                report_startup_error(background, &format!("无法注册鼠标遮罩：{error}"));
+                cx.quit();
+                return;
+            }
             let options = WindowOptions {
                 show: !background,
                 focus: !background,
@@ -1281,11 +1431,22 @@ pub fn run() {
                 window_min_size: Some(size(px(740.), px(540.))),
                 ..WindowOptions::default()
             };
-            let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {
-                cx.new(|cx| KeepWindow::new(window, cx))
-            })
-            .expect("failed to open KeepWindow");
+            let opened = gpui_kit::open_window(options, cx, |window, cx| {
+                cx.new(|cx| KeepWindow::new(window, cx, recovery.clone(), recovery_message.clone()))
+            });
+            let (handle, view) = match opened {
+                Ok(opened) => opened,
+                Err(error) => {
+                    report_startup_error(
+                        background,
+                        &format!("无法创建 KeepWindow 主窗口：{error}"),
+                    );
+                    cx.quit();
+                    return;
+                }
+            };
             if background && view.read(cx).tray.is_none() {
+                report_startup_error(true, &view.read(cx).status);
                 handle
                     .update(cx, |_, window, _| {
                         if let Ok(native) = HasWindowHandle::window_handle(window)
@@ -1302,4 +1463,24 @@ pub fn run() {
                     .ok();
             }
         });
+}
+
+fn report_startup_error(background: bool, error: &str) {
+    if background {
+        if let Some(root) = std::env::var_os("LOCALAPPDATA") {
+            let path = std::path::PathBuf::from(root).join("KeepWindow/startup-error.log");
+            let _ = crate::storage::atomic_write(&path, error.as_bytes());
+        }
+    } else {
+        unsafe {
+            let text = window::wide(error);
+            windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                None,
+                windows::core::PCWSTR(text.as_ptr()),
+                windows::core::w!("KeepWindow"),
+                windows::Win32::UI::WindowsAndMessaging::MB_OK
+                    | windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+            );
+        }
+    }
 }

@@ -186,6 +186,49 @@ fn automatic_protection_survives_restart_and_respects_manual_restore() {
     }
     wait(|| restarted.0.try_wait().unwrap().is_some());
     assert!(!disabled());
+
+    let mut crashed = launch(&profile);
+    wait(disabled);
+    wait(|| main_window(crashed.0.id()).is_some());
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("recovery.json")).unwrap()).unwrap();
+    assert_eq!(journal["records"].as_array().unwrap().len(), 1);
+    crashed.0.kill().unwrap();
+    crashed.0.wait().unwrap();
+    assert!(
+        disabled(),
+        "crash should leave the menu disabled until restart"
+    );
+    assert!(directory.join("running").exists());
+    // Disable automatic rules so this restart demonstrates recovery independently of protection.
+    let mut config: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("config.json")).unwrap()).unwrap();
+    assert_eq!(config["version"], 2);
+    assert_eq!(config["startup_enabled"], false);
+    config["rules"][0]["automatic"] = false.into();
+    std::fs::write(
+        directory.join("config.json"),
+        serde_json::to_vec(&config).unwrap(),
+    )
+    .unwrap();
+    let mut recovered = launch(&profile);
+    wait(|| main_window(recovered.0.id()).is_some());
+    wait(|| !disabled());
+    let journal: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(directory.join("recovery.json")).unwrap()).unwrap();
+    assert!(journal["records"].as_array().unwrap().is_empty());
+    unsafe {
+        PostMessageW(
+            main_window(recovered.0.id()),
+            WM_COMMAND,
+            WPARAM(0xA103),
+            LPARAM(0),
+        )
+        .unwrap();
+    }
+    wait(|| recovered.0.try_wait().unwrap().is_some());
+    assert!(!directory.join("running").exists());
+    assert!(!directory.join("recovery.json").exists());
     drop(child);
     std::fs::remove_file(directory.join("config.json")).unwrap();
     std::fs::remove_dir(directory).unwrap();
