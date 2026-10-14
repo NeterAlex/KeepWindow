@@ -1,6 +1,11 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
+
 use gpui_kit::{
-    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _, Pixels, Stateful,
-    StatefulInteractiveElement as _, Styled as _, Window,
+    App, Context, Div, InteractiveElement as _, IntoElement, ParentElement as _, Pixels,
+    RenderImage, Stateful, StatefulInteractiveElement as _, Styled as _, Window,
     assets::IconName,
     base::StyledExt,
     component::{
@@ -9,12 +14,15 @@ use gpui_kit::{
         tag::Tag,
         tooltip::Tooltip,
     },
-    div,
+    div, img,
     prelude::FluentBuilder as _,
     px, rgb,
 };
 
-use crate::window::WindowInfo;
+use crate::{
+    icon::{WindowIconKey, load_window_icon},
+    window::WindowInfo,
+};
 
 pub fn init_theme(cx: &mut App) {
     Theme::update(cx, |theme| {
@@ -64,6 +72,7 @@ pub struct WindowTable {
     pub selected_row: Option<usize>,
     layout_width: Pixels,
     columns: Vec<Column>,
+    icons: HashMap<WindowIconKey, Option<Arc<RenderImage>>>,
 }
 
 impl WindowTable {
@@ -83,6 +92,45 @@ impl WindowTable {
                     .width(122.)
                     .resizable(false),
             ],
+            icons: HashMap::new(),
+        }
+    }
+
+    pub fn sync_icons(
+        &mut self,
+        targets: &[WindowInfo],
+        window: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        let current: HashSet<_> = targets.iter().map(WindowIconKey::from).collect();
+        self.icons.retain(|key, image| {
+            if current.contains(key) {
+                return true;
+            }
+            if let Some(image) = image {
+                cx.drop_image(image.clone(), Some(window));
+            }
+            false
+        });
+        for key in current {
+            if self.icons.contains_key(&key) {
+                continue;
+            }
+            self.icons.insert(key.clone(), None);
+            cx.spawn_in(window, async move |table, cx| {
+                let request = key.clone();
+                let image = cx
+                    .background_executor()
+                    .spawn(async move { load_window_icon(&request) })
+                    .await;
+                let _ = table.update_in(cx, |table, _, cx| {
+                    if let Some(cached) = table.delegate_mut().icons.get_mut(&key) {
+                        *cached = image;
+                        cx.notify();
+                    }
+                });
+            })
+            .detach();
         }
     }
 
@@ -134,7 +182,21 @@ impl TableDelegate for WindowTable {
         match col_ix {
             0 => {
                 let title = row.info.display_title();
+                let icon = div().size(px(16.)).flex_shrink_0().child(
+                    self.icons
+                        .get(&WindowIconKey::from(&row.info))
+                        .and_then(Option::as_ref)
+                        .map(|image| img(image.clone()).size_full().into_any_element())
+                        .unwrap_or_else(|| {
+                            Icon::new(IconName::AppWindow)
+                                .size(px(16.))
+                                .text_color(theme.muted_foreground)
+                                .into_any_element()
+                        }),
+                );
                 cell.relative()
+                    .gap_2()
+                    .min_w_0()
                     .when(selected, |cell| {
                         cell.child(
                             div()
@@ -147,10 +209,12 @@ impl TableDelegate for WindowTable {
                                 .bg(theme.foreground),
                         )
                     })
+                    .child(icon)
                     .child(
                         div()
                             .id(("window-title", row_ix))
-                            .w_full()
+                            .flex_1()
+                            .min_w_0()
                             .truncate()
                             .child(title.clone())
                             .tooltip(move |window, cx| {

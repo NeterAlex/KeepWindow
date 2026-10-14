@@ -1081,6 +1081,7 @@ impl KeepWindow {
 impl Render for KeepWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.table.update(cx, |table, cx| {
+            table.delegate_mut().sync_icons(&self.windows, window, cx);
             if table
                 .delegate_mut()
                 .fit_width(window.bounds().size.width - px(34.))
