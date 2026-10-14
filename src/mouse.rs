@@ -22,6 +22,7 @@ use crate::{
 struct Target {
     hwnd: usize,
     overlay: usize,
+    calibration: usize,
     marker: Vec<u16>,
     options: Options,
 }
@@ -78,6 +79,34 @@ pub struct MouseRegistration {
 }
 
 impl MouseRegistration {
+    pub fn set_calibration(&self, hwnd: Option<HWND>) {
+        let mut registry = self
+            .service
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(target) = registry
+            .targets
+            .iter_mut()
+            .find(|target| target.marker == self.marker)
+        {
+            target.calibration = hwnd.map_or(0, |hwnd| hwnd.0 as usize);
+        }
+    }
+    pub fn update(&self, options: Options) {
+        let mut registry = self
+            .service
+            .registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(target) = registry
+            .targets
+            .iter_mut()
+            .find(|target| target.marker == self.marker)
+        {
+            target.options = options;
+        }
+    }
     pub fn new(
         hwnd: HWND,
         overlay: Option<HWND>,
@@ -93,6 +122,7 @@ impl MouseRegistration {
             .push(Target {
                 hwnd: hwnd.0 as usize,
                 overlay: overlay.map_or(0, |hwnd| hwnd.0 as usize),
+                calibration: 0,
                 marker: marker.to_vec(),
                 options,
             });
@@ -185,7 +215,9 @@ impl Drop for Service {
 fn hit_target(target: &Target, point: POINT, root: HWND) -> bool {
     let hwnd = HWND(target.hwnd as *mut _);
     unsafe {
-        if (root.0 as usize != target.hwnd && root.0 as usize != target.overlay)
+        if (root.0 as usize != target.hwnd
+            && root.0 as usize != target.overlay
+            && root.0 as usize != target.calibration)
             || !IsWindowVisible(hwnd).as_bool()
             || IsIconic(hwnd).as_bool()
             || is_cloaked(hwnd)
@@ -194,7 +226,15 @@ fn hit_target(target: &Target, point: POINT, root: HWND) -> bool {
             return false;
         }
     }
-    shield_rect(hwnd, target.options).is_ok_and(|rect| {
+    let rect = if target.calibration != 0 {
+        let mut rect = windows::Win32::Foundation::RECT::default();
+        unsafe { GetWindowRect(HWND(target.calibration as *mut _), &mut rect) }
+            .map(|_| rect)
+            .map_err(|e| e.to_string())
+    } else {
+        shield_rect(hwnd, target.options)
+    };
+    rect.is_ok_and(|rect| {
         point.x >= rect.left && point.x < rect.right && point.y >= rect.top && point.y < rect.bottom
     })
 }

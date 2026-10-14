@@ -53,25 +53,9 @@ pub fn init_theme(cx: &mut App) {
     });
 }
 
-pub fn protection_tag(protected: bool, cx: &App) -> Tag {
-    let theme = cx.theme();
-    let tag = if protected {
-        Tag::custom(theme.primary, theme.primary_foreground, theme.primary)
-    } else {
-        Tag::custom(theme.table, theme.muted_foreground, theme.border)
-    };
-    tag.small()
-        .rounded_full()
-        .gap_1()
-        .when(protected, |tag| {
-            tag.child(Icon::new(IconName::Lock).size(px(12.)))
-        })
-        .child(if protected { "已保护" } else { "未保护" })
-}
-
 pub struct WindowRow {
     pub info: WindowInfo,
-    pub protection: Option<&'static str>,
+    pub protection: Option<(String, String)>,
 }
 
 pub struct WindowTable {
@@ -186,9 +170,17 @@ impl TableDelegate for WindowTable {
                 .child(format!("0x{:X}", row.info.hwnd.0 as usize))
                 .into_any_element(),
             _ => {
-                let description = row.protection.unwrap_or("尚未开启保护");
-                let status = if row.protection.is_some() {
-                    protection_tag(true, cx).into_any_element()
+                let description = row
+                    .protection
+                    .as_ref()
+                    .map(|(_, detail)| detail.clone())
+                    .unwrap_or_else(|| "尚未开启保护".into());
+                let status = if let Some((label, _)) = &row.protection {
+                    Tag::custom(theme.primary, theme.primary_foreground, theme.primary)
+                        .small()
+                        .rounded_full()
+                        .child(label.clone())
+                        .into_any_element()
                 } else {
                     div()
                         .text_xs()
@@ -197,10 +189,9 @@ impl TableDelegate for WindowTable {
                         .into_any_element()
                 };
                 cell.child(
-                    div()
-                        .id(("protection-tag", row_ix))
-                        .child(status)
-                        .tooltip(move |window, cx| Tooltip::new(description).build(window, cx)),
+                    div().id(("protection-tag", row_ix)).child(status).tooltip(
+                        move |window, cx| Tooltip::new(description.clone()).build(window, cx),
+                    ),
                 )
                 .into_any_element()
             }

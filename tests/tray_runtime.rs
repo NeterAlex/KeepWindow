@@ -66,9 +66,12 @@ fn main_window(pid: u32) -> Option<HWND> {
 
 #[test]
 fn background_app_handles_tray_minimize_close_restore_and_exit_without_rendering() {
+    let profile = std::env::temp_dir().join(format!("keep-window-runtime-{}", std::process::id()));
+    std::fs::create_dir_all(&profile).unwrap();
     let mut app = TestApp(
         Command::new(env!("CARGO_BIN_EXE_keep-window"))
             .arg("--background")
+            .env("LOCALAPPDATA", &profile)
             .creation_flags(CREATE_NO_WINDOW.0)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -86,6 +89,29 @@ fn background_app_handles_tray_minimize_close_restore_and_exit_without_rendering
             !IsWindowVisible(hwnd).as_bool(),
             "--background showed the main window"
         );
+        let mut duplicate = Command::new(env!("CARGO_BIN_EXE_keep-window"))
+            .env("LOCALAPPDATA", &profile)
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .unwrap();
+        wait_for("duplicate process exit", || {
+            duplicate.try_wait().unwrap().is_some()
+        });
+        wait_for("duplicate wakes existing window", || {
+            IsWindowVisible(hwnd).as_bool()
+        });
+        PostMessageW(Some(hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)).unwrap();
+        wait_for("hide after duplicate", || !IsWindowVisible(hwnd).as_bool());
+        let mut duplicate_background = Command::new(env!("CARGO_BIN_EXE_keep-window"))
+            .arg("--background")
+            .env("LOCALAPPDATA", &profile)
+            .creation_flags(CREATE_NO_WINDOW.0)
+            .spawn()
+            .unwrap();
+        wait_for("background duplicate exit", || {
+            duplicate_background.try_wait().unwrap().is_some()
+        });
+        assert!(!IsWindowVisible(hwnd).as_bool());
         // The native menu uses these WM_COMMAND IDs; exercise the same path as a real tray click.
         PostMessageW(Some(hwnd), WM_COMMAND, WPARAM(0xA101), LPARAM(0)).unwrap();
         wait_for("tray show from hidden startup", || {
@@ -125,4 +151,5 @@ fn background_app_handles_tray_minimize_close_restore_and_exit_without_rendering
         exit.is_some()
     });
     assert!(exit.unwrap().success());
+    std::fs::remove_dir(profile).unwrap();
 }

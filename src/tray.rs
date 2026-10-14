@@ -10,9 +10,10 @@ use windows::{
         Foundation::{HWND, LPARAM, LRESULT, POINT, WPARAM},
         UI::{
             Shell::{
-                DefSubclassProc, NIF_ICON, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP, NIM_ADD, NIM_DELETE,
-                NIM_MODIFY, NIM_SETVERSION, NIN_SELECT, NOTIFYICON_VERSION_4, NOTIFYICONDATAW,
-                RemoveWindowSubclass, SetWindowSubclass, Shell_NotifyIconW,
+                DefSubclassProc, NIF_ICON, NIF_INFO, NIF_MESSAGE, NIF_SHOWTIP, NIF_TIP,
+                NIIF_WARNING, NIM_ADD, NIM_DELETE, NIM_MODIFY, NIM_SETVERSION, NIN_SELECT,
+                NOTIFYICON_VERSION_4, NOTIFYICONDATAW, RemoveWindowSubclass, SetWindowSubclass,
+                Shell_NotifyIconW,
             },
             WindowsAndMessaging::*,
         },
@@ -42,6 +43,7 @@ struct State {
     data: Cell<NOTIFYICONDATAW>,
     icons: RefCell<WindowIcons>,
     taskbar_created: u32,
+    show_message: u32,
     actions: RefCell<VecDeque<Action>>,
 }
 
@@ -135,9 +137,16 @@ impl Tray {
             data: Cell::new(data),
             icons: RefCell::new(icons),
             taskbar_created: unsafe { RegisterWindowMessageW(w!("TaskbarCreated")) },
+            show_message: crate::instance::show_message(),
             actions: RefCell::new(VecDeque::new()),
         });
         unsafe {
+            let message = state.show_message;
+            if message == 0 {
+                return Err("无法注册实例唤起消息。".into());
+            }
+            ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, None)
+                .map_err(|e| format!("无法设置实例唤起权限：{e}"))?;
             if !SetWindowSubclass(
                 hwnd,
                 Some(tray_proc),
@@ -152,6 +161,14 @@ impl Tray {
         let tray = Self { state };
         if !tray.state.add_icon() {
             return Err("无法添加系统托盘图标，主界面将保持可见。".into());
+        }
+        unsafe {
+            SetPropW(
+                hwnd,
+                windows::core::PCWSTR(crate::instance::property().as_ptr()),
+                Some(windows::Win32::Foundation::HANDLE(std::ptr::dangling_mut())),
+            )
+            .map_err(|e| format!("无法标记主窗口：{e}"))?;
         }
         Ok(tray)
     }
@@ -178,12 +195,29 @@ impl Tray {
     pub fn take_actions(&self) -> Vec<Action> {
         self.state.actions.borrow_mut().drain(..).collect()
     }
+
+    pub fn notify(&self, text: &str) {
+        let mut data = self.state.data.get();
+        data.uFlags = NIF_INFO;
+        data.dwInfoFlags = NIIF_WARNING;
+        let title = crate::window::wide("KeepWindow 保护提示");
+        data.szInfoTitle[..title.len()].copy_from_slice(&title);
+        let text: Vec<u16> = text.encode_utf16().take(data.szInfo.len() - 1).collect();
+        data.szInfo[..text.len()].copy_from_slice(&text);
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
 }
 
 impl Drop for Tray {
     fn drop(&mut self) {
         unsafe {
             let data = self.state.data.get();
+            let _ = RemovePropW(
+                data.hWnd,
+                windows::core::PCWSTR(crate::instance::property().as_ptr()),
+            );
             let _ = RemoveWindowSubclass(data.hWnd, Some(tray_proc), SUBCLASS_ID);
             let _ = Shell_NotifyIconW(NIM_DELETE, &data);
         }
@@ -203,6 +237,16 @@ unsafe extern "system" fn tray_proc(
         let pointer = data as *const State;
         Rc::increment_strong_count(pointer);
         let state = Rc::from_raw(pointer);
+        if message == state.show_message {
+            let command = if IsIconic(hwnd).as_bool() {
+                SW_RESTORE
+            } else {
+                SW_SHOW
+            };
+            let _ = ShowWindow(hwnd, command);
+            let _ = SetForegroundWindow(hwnd);
+            return LRESULT(1);
+        }
         if state.taskbar_created != 0 && message == state.taskbar_created {
             if !state.add_icon() {
                 // Keep an access path to the app if Explorer cannot recreate the icon.

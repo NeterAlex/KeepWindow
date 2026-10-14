@@ -3302,10 +3302,12 @@ dependencies = [
 
 [[package]]
 name = "keep-window"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "gpui-kit",
  "raw-window-handle",
+ "serde",
+ "serde_json",
  "windows 0.62.2",
  "winresource",
 ]

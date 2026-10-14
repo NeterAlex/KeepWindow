@@ -1,4 +1,7 @@
-use std::time::Duration;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use gpui_kit::{
     AppContext as _, Bounds, Context, Entity, InteractiveElement as _, IntoElement,
@@ -24,6 +27,8 @@ use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use windows::Win32::Foundation::HWND;
 
 use crate::{
+    calibration::{Calibration, Outcome},
+    config::{Config, Rule, Store},
     protection::{Options, Protection},
     tray::{Action as TrayAction, Tray},
     ui::{self, WindowRow, WindowTable},
@@ -44,6 +49,20 @@ pub struct KeepWindow {
     height: Entity<InputState>,
     right_offset: Entity<InputState>,
     top_offset: Entity<InputState>,
+    opacity: Entity<InputState>,
+    title_contains: Entity<InputState>,
+    automatic: bool,
+    config: Config,
+    store: Store,
+    config_error: Option<String>,
+    rules_open: bool,
+    editing_rule: Option<usize>,
+    suppressed: Vec<WindowInfo>,
+    attempts: Vec<(WindowInfo, Rule, Option<String>)>,
+    paths: HashMap<u32, (Option<u64>, Option<String>)>,
+    last_scan: Instant,
+    exiting: bool,
+    calibration: Option<Calibration>,
     tray: Option<Tray>,
     _refresh_task: gpui_kit::Task<()>,
     _quit_subscription: gpui_kit::Subscription,
@@ -54,7 +73,7 @@ pub struct KeepWindow {
 struct Draft {
     system_menu: bool,
     mouse_shield: bool,
-    numbers: [String; 4],
+    numbers: [String; 5],
 }
 
 impl From<Options> for Draft {
@@ -67,6 +86,7 @@ impl From<Options> for Draft {
                 options.height,
                 options.right_offset,
                 options.top_offset,
+                options.opacity,
             ]
             .map(|value| value.to_string()),
         }
@@ -128,6 +148,16 @@ impl KeepWindow {
         });
         let search =
             cx.new(|cx| InputState::new(window, cx).placeholder("搜索窗口名称、PID 或句柄"));
+        let opacity = cx.new(|cx| {
+            InputState::new(window, cx)
+                .default_value("28")
+                .step(1.)
+                .min(5.)
+                .max(80.)
+        });
+        let title_contains = cx
+            .new(|cx| InputState::new(window, cx).placeholder("标题包含（留空匹配所有同类窗口）"));
+        let (store, config, config_error) = Store::load();
         let table = cx.new(|cx| {
             TableState::new(WindowTable::new(), window, cx)
                 .col_selectable(false)
@@ -180,7 +210,14 @@ impl KeepWindow {
                 }
             }),
         ];
-        for input in [&width, &height, &right_offset, &top_offset] {
+        for input in [
+            &width,
+            &height,
+            &right_offset,
+            &top_offset,
+            &opacity,
+            &title_contains,
+        ] {
             subscriptions.push(cx.subscribe(input, |_, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
                     cx.notify();
@@ -209,15 +246,33 @@ impl KeepWindow {
             height,
             right_offset,
             top_offset,
+            opacity,
+            title_contains,
+            automatic: false,
+            config,
+            store,
+            config_error,
+            rules_open: false,
+            editing_rule: None,
+            suppressed: Vec::new(),
+            attempts: Vec::new(),
+            paths: HashMap::new(),
+            last_scan: Instant::now(),
+            exiting: false,
+            calibration: None,
             tray: None,
-            _refresh_task: cx.spawn(async move |this, cx| {
+            _refresh_task: cx.spawn_in(window, async move |this, cx| {
                 loop {
                     cx.background_executor()
                         .timer(Duration::from_millis(100))
                         .await;
                     if this
-                        .update(cx, |this, cx| {
+                        .update_in(cx, |this, window, cx| {
+                            this.tick_calibration(window, cx);
                             this.tick(cx);
+                            if this.last_scan.elapsed() >= Duration::from_secs(1) {
+                                this.scan(cx);
+                            }
                             this.process_tray_actions(cx);
                         })
                         .is_err()
@@ -229,26 +284,65 @@ impl KeepWindow {
             _quit_subscription: quit_subscription,
             _subscriptions: subscriptions,
         };
-        this.refresh(cx);
         match tray {
             Ok(tray) => {
                 this.tray = Some(tray);
             }
             Err(error) => this.status = error.into(),
         }
+        this.scan(cx);
+        if let Some(error) = &this.config_error {
+            this.status = error.clone().into();
+        }
         this
     }
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
+        self.scan(cx);
+        cx.notify();
+    }
+
+    fn scan(&mut self, cx: &mut Context<Self>) {
+        self.last_scan = Instant::now();
         self.save_draft(cx);
         match window::enumerate() {
-            Ok(windows) => {
+            Ok(mut windows) => {
+                for protection in &self.protections {
+                    if protection.alive()
+                        && !windows
+                            .iter()
+                            .any(|item| item.same_identity(&protection.target))
+                    {
+                        windows.push(
+                            WindowInfo::inspect(protection.target.hwnd)
+                                .unwrap_or_else(|| protection.target.clone()),
+                        );
+                    }
+                }
+                self.suppressed.retain(|target| target.is_same_window());
+                self.attempts
+                    .retain(|(target, _, _)| target.is_same_window());
+                self.paths
+                    .retain(|pid, _| windows.iter().any(|item| item.pid == *pid));
+                for target in &windows {
+                    let creation = window::process_creation(target.pid);
+                    if self
+                        .paths
+                        .get(&target.pid)
+                        .is_none_or(|(previous, _)| creation.is_none() || *previous != creation)
+                    {
+                        self.paths
+                            .insert(target.pid, (creation, window::process_path(target.pid)));
+                    }
+                }
                 self.selected = window::retain_selection(&windows, self.selected.as_ref(), "");
                 self.drafts
                     .retain(|(target, _)| windows.iter().any(|item| item.same_identity(target)));
                 self.windows = windows;
+                if !self.exiting {
+                    self.auto_protect();
+                }
                 self.rebuild_table(cx);
-                self.status = "窗口列表已更新。".into();
             }
             Err(error) => self.status = format!("刷新失败：{error}").into(),
         }
@@ -257,12 +351,16 @@ impl KeepWindow {
 
     fn tick(&mut self, cx: &mut Context<Self>) {
         let mut ended = Vec::new();
-        self.protections
-            .retain_mut(|protection| match protection.tick() {
+        self.protections.retain_mut(|protection| {
+            if protection.recovery_failed {
+                return protection.alive();
+            }
+            match protection.tick() {
                 Ok(()) => true,
                 Err(error) => match protection.restore() {
                     Ok(()) => {
                         ended.push(error);
+                        self.suppressed.push(protection.target.clone());
                         false
                     }
                     Err(e) => {
@@ -270,10 +368,14 @@ impl KeepWindow {
                         true
                     }
                 },
-            });
+            }
+        });
         if !ended.is_empty() {
             self.refresh(cx);
             self.status = ended.join("；").into();
+            if let Some(tray) = &self.tray {
+                tray.notify(&self.status);
+            }
         }
     }
 
@@ -301,6 +403,11 @@ impl KeepWindow {
     }
 
     fn exit(&mut self, cx: &mut Context<Self>) {
+        self.exiting = true;
+        self.calibration.take();
+        for protection in &mut self.protections {
+            protection.set_calibration(None);
+        }
         self.restore_all(cx);
         if self.protections.is_empty() {
             self.tray.take();
@@ -335,6 +442,7 @@ impl KeepWindow {
                 &self.height,
                 &self.right_offset,
                 &self.top_offset,
+                &self.opacity,
             ]
             .map(|input| input.read(cx).value().to_string()),
         };
@@ -368,6 +476,11 @@ impl KeepWindow {
                     .find(|(item, _)| item.same_identity(&target))
                     .map(|(_, draft)| draft.clone())
             })
+            .or_else(|| {
+                self.path_for(&target)
+                    .and_then(|path| self.config.matching_rule(path, &target, false))
+                    .map(|(_, rule)| Draft::from(rule.options))
+            })
             .unwrap_or_else(|| Options::default().into());
         self.system_menu = draft.system_menu;
         self.mouse_shield = draft.mouse_shield;
@@ -376,6 +489,7 @@ impl KeepWindow {
             &self.height,
             &self.right_offset,
             &self.top_offset,
+            &self.opacity,
         ]
         .into_iter()
         .zip(draft.numbers)
@@ -383,6 +497,26 @@ impl KeepWindow {
             input.update(cx, |state, cx| state.set_value(value, window, cx));
         }
         self.selected = Some(target);
+        self.editing_rule = None;
+        let matched = self
+            .selected
+            .as_ref()
+            .and_then(|target| {
+                self.path_for(target)
+                    .and_then(|path| self.config.matching_rule(path, target, false))
+            })
+            .map(|(index, rule)| (index, rule.clone()));
+        if let Some((index, rule)) = matched {
+            self.editing_rule = Some(index);
+            self.automatic = rule.automatic;
+            self.title_contains.update(cx, |state, cx| {
+                state.set_value(rule.title_contains, window, cx)
+            });
+        } else {
+            self.automatic = false;
+            self.title_contains
+                .update(cx, |state, cx| state.set_value("", window, cx));
+        }
         cx.notify();
     }
 
@@ -398,13 +532,20 @@ impl KeepWindow {
             .filter(|item| item.matches_query(&query))
             .map(|item| WindowRow {
                 info: item.clone(),
-                protection: self.protection_for(item).map(|p| {
-                    match (p.options.system_menu, p.options.mouse_shield) {
-                        (true, true) => "系统关闭保护 + 鼠标遮罩",
-                        (true, false) => "系统关闭保护",
-                        _ => "鼠标遮罩",
-                    }
-                }),
+                protection: self
+                    .protection_for(item)
+                    .map(|p| {
+                        let status = p.status();
+                        (status.label().into(), status.description())
+                    })
+                    .or_else(|| {
+                        self.attempts
+                            .iter()
+                            .find(|(target, _, error)| {
+                                target.same_identity(item) && error.is_some()
+                            })
+                            .map(|(_, _, error)| ("保护失败".into(), error.clone().unwrap()))
+                    }),
             })
             .collect();
         let selected_row = self
@@ -447,11 +588,30 @@ impl KeepWindow {
             mouse_shield: self.mouse_shield,
             ..Options::default()
         };
-        if self.mouse_shield {
-            options.width = number(&self.width, "遮罩宽度", 1, 512)?;
-            options.height = number(&self.height, "遮罩高度", 1, 512)?;
-            options.right_offset = number(&self.right_offset, "右侧内缩", -512, 512)?;
-            options.top_offset = number(&self.top_offset, "顶部下移", -512, 512)?;
+        for (field, input, name, min, max) in [
+            (&mut options.width, &self.width, "遮罩宽度", 1, 512),
+            (&mut options.height, &self.height, "遮罩高度", 1, 512),
+            (
+                &mut options.right_offset,
+                &self.right_offset,
+                "右侧内缩",
+                -512,
+                512,
+            ),
+            (
+                &mut options.top_offset,
+                &self.top_offset,
+                "顶部下移",
+                -512,
+                512,
+            ),
+            (&mut options.opacity, &self.opacity, "透明度", 5, 80),
+        ] {
+            match number(input, name, min, max) {
+                Ok(value) => *field = value,
+                Err(error) if self.mouse_shield => return Err(error.into()),
+                _ => {}
+            }
         }
         Ok(options)
     }
@@ -463,10 +623,11 @@ impl KeepWindow {
             return;
         };
         if self.protection_for(&target).is_some() {
-            self.status = "所选窗口已受保护，请先恢复后再修改参数。".into();
-            cx.notify();
             return;
         }
+        self.suppressed.retain(|item| !item.same_identity(&target));
+        self.attempts
+            .retain(|(item, _, _)| !item.same_identity(&target));
         self.save_draft(cx);
         match self.options(cx) {
             Ok(options) => match Protection::start(target.clone(), options) {
@@ -497,6 +658,7 @@ impl KeepWindow {
             cx.notify();
             return;
         };
+        self.suppressed.push(target.clone());
         match self.protections[index].restore() {
             Ok(()) => {
                 self.protections.remove(index);
@@ -509,6 +671,8 @@ impl KeepWindow {
     }
 
     fn restore_all(&mut self, cx: &mut Context<Self>) {
+        self.suppressed
+            .extend(self.protections.iter().map(|p| p.target.clone()));
         let mut errors = Vec::new();
         self.protections.retain_mut(|p| match p.restore() {
             Ok(()) => false,
@@ -521,6 +685,257 @@ impl KeepWindow {
             "已恢复全部窗口。".into()
         } else {
             format!("部分窗口恢复失败：{}", errors.join("；")).into()
+        };
+        self.rebuild_table(cx);
+        cx.notify();
+    }
+
+    fn path_for(&self, target: &WindowInfo) -> Option<&str> {
+        self.paths
+            .get(&target.pid)
+            .and_then(|(_, path)| path.as_deref())
+    }
+
+    fn auto_protect(&mut self) {
+        for target in self.windows.clone() {
+            if self.protection_for(&target).is_some()
+                || self
+                    .suppressed
+                    .iter()
+                    .any(|item| item.same_identity(&target))
+            {
+                continue;
+            }
+            let rule = self
+                .path_for(&target)
+                .and_then(|path| self.config.matching_rule(path, &target, true))
+                .map(|(_, rule)| rule.clone());
+            let Some(rule) = rule else {
+                continue;
+            };
+            if self
+                .attempts
+                .iter()
+                .any(|(item, previous, _)| item.same_identity(&target) && previous == &rule)
+            {
+                continue;
+            }
+            self.attempts
+                .retain(|(item, _, _)| !item.same_identity(&target));
+            match Protection::start(target.clone(), rule.options) {
+                Ok(protection) => {
+                    self.protections.push(protection);
+                    self.attempts.push((target, rule, None));
+                }
+                Err(error) => {
+                    self.status =
+                        format!("自动保护“{}”失败：{error}", target.display_title()).into();
+                    if let Some(tray) = &self.tray {
+                        tray.notify(&self.status);
+                    }
+                    self.attempts.push((target, rule, Some(error)));
+                }
+            }
+        }
+    }
+
+    fn set_fields(&mut self, options: Options, window: &mut Window, cx: &mut Context<Self>) {
+        self.system_menu = options.system_menu;
+        self.mouse_shield = options.mouse_shield;
+        for (input, value) in [
+            &self.width,
+            &self.height,
+            &self.right_offset,
+            &self.top_offset,
+            &self.opacity,
+        ]
+        .into_iter()
+        .zip(Draft::from(options).numbers)
+        {
+            input.update(cx, |state, cx| state.set_value(value, window, cx));
+        }
+    }
+
+    fn save_rule(&mut self, cx: &mut Context<Self>) {
+        let rule = (|| -> Result<Rule, SharedString> {
+            let editing = self
+                .editing_rule
+                .and_then(|index| self.config.rules.get(index));
+            let target = self.selected.as_ref();
+            let path = editing
+                .map(|rule| rule.path.as_str())
+                .or_else(|| target.and_then(|target| self.path_for(target)))
+                .ok_or("无法获取程序路径，不能保存规则。")?;
+            let class = editing
+                .map(|rule| rule.class.clone())
+                .or_else(|| target.map(|target| target.class.clone()))
+                .ok_or("请先选择窗口。")?;
+            Ok(Rule {
+                path: path.into(),
+                class,
+                title_contains: self.title_contains.read(cx).value().trim().to_string(),
+                automatic: self.automatic,
+                options: self.options(cx)?,
+            })
+        })();
+        match rule {
+            Ok(rule) => {
+                let mut config = self.config.clone();
+                config.upsert(rule, self.editing_rule);
+                self.commit_config(config);
+                self.editing_rule = None;
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn commit_config(&mut self, config: Config) {
+        match self.store.save(&config) {
+            Ok(()) => {
+                self.attempts
+                    .retain(|(_, rule, _)| config.rules.iter().any(|current| current == rule));
+                self.config = config;
+                self.status = "应用规则已保存。".into();
+            }
+            Err(error) => self.status = error.into(),
+        }
+    }
+
+    fn edit_rule(&mut self, index: usize, window: &mut Window, cx: &mut Context<Self>) {
+        self.save_draft(cx);
+        self.selected = None;
+        self.rebuild_table(cx);
+        let rule = self.config.rules[index].clone();
+        self.set_fields(rule.options, window, cx);
+        self.title_contains.update(cx, |state, cx| {
+            state.set_value(rule.title_contains, window, cx)
+        });
+        self.automatic = rule.automatic;
+        self.editing_rule = Some(index);
+        self.status = "正在编辑已保存规则，点击保存完成修改。".into();
+        cx.notify();
+    }
+
+    fn apply_settings(&mut self, cx: &mut Context<Self>) {
+        let result = self.options(cx).and_then(|options| {
+            let target = self.selected.clone().ok_or("请先选择窗口。")?;
+            let protection = self
+                .protections
+                .iter_mut()
+                .find(|p| p.target.same_identity(&target))
+                .ok_or("窗口未保护。")?;
+            protection
+                .update_options(options)
+                .map_err(SharedString::from)
+        });
+        self.status = match result {
+            Ok(()) => "保护设置已更新。".into(),
+            Err(error) => error,
+        };
+        self.rebuild_table(cx);
+        cx.notify();
+    }
+
+    fn start_calibration(&mut self, cx: &mut Context<Self>) {
+        let result = self.options(cx).and_then(|options| {
+            let target = self.selected.clone().ok_or("请先选择窗口。")?;
+            if self
+                .protection_for(&target)
+                .is_some_and(|p| p.recovery_failed)
+            {
+                return Err("请先重试恢复。".into());
+            }
+            Calibration::new(target, options).map_err(SharedString::from)
+        });
+        match result {
+            Ok(mut calibration) => {
+                if let Some(protection) = self
+                    .protections
+                    .iter_mut()
+                    .find(|p| p.target.same_identity(&calibration.target))
+                {
+                    calibration.previous_protection = Some(protection.options);
+                    protection.set_calibration(Some(calibration.frame()));
+                }
+                self.calibration = Some(calibration);
+                self.status = "拖动遮罩移动，拖动右下角缩放；Enter 保存，Esc 取消。".into();
+            }
+            Err(error) => self.status = error,
+        }
+        cx.notify();
+    }
+
+    fn tick_calibration(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let Some(calibration) = &mut self.calibration else {
+            return;
+        };
+        let mut outcome = calibration.tick();
+        if let Some(protection) = self
+            .protections
+            .iter_mut()
+            .find(|p| p.target.same_identity(&calibration.target))
+        {
+            let mut options = protection.options;
+            options.width = calibration.current.width;
+            options.height = calibration.current.height;
+            options.right_offset = calibration.current.right_offset;
+            options.top_offset = calibration.current.top_offset;
+            if let Err(error) = protection.update_options(options) {
+                outcome = Err(error);
+            }
+        }
+        if matches!(outcome, Ok(None)) {
+            return;
+        }
+        let calibration = self.calibration.take().unwrap();
+        let saved = matches!(outcome, Ok(Some(Outcome::Save)));
+        let options = if saved {
+            calibration.current
+        } else {
+            calibration.original
+        };
+        let mut error = outcome.as_ref().err().cloned();
+        if let Some(protection) = self
+            .protections
+            .iter_mut()
+            .find(|p| p.target.same_identity(&calibration.target))
+        {
+            protection.set_calibration(None);
+            let restored = if saved {
+                options
+            } else {
+                calibration.previous_protection.unwrap_or(options)
+            };
+            if protection.alive()
+                && let Err(e) = protection.update_options(restored)
+            {
+                error = Some(e);
+            }
+        }
+        if self
+            .selected
+            .as_ref()
+            .is_some_and(|target| target.same_identity(&calibration.target))
+        {
+            self.set_fields(options, window, cx);
+        }
+        if saved
+            && error.is_none()
+            && let Some(path) = self.path_for(&calibration.target)
+            && let Some((index, _)) = self.config.matching_rule(path, &calibration.target, false)
+        {
+            let mut config = self.config.clone();
+            config.rules[index].options = options;
+            match self.store.save(&config) {
+                Ok(()) => self.config = config,
+                Err(e) => error = Some(e),
+            }
+        }
+        self.status = match error {
+            Some(error) => error.into(),
+            _ if saved => "遮罩校准已保存。".into(),
+            _ => "已取消校准并恢复原位置。".into(),
         };
         self.rebuild_table(cx);
         cx.notify();
@@ -540,10 +955,18 @@ impl Render for KeepWindow {
         let theme = cx.theme();
         let selected = self.selected.as_ref();
         let protected = selected.is_some_and(|target| self.protection_for(target).is_some());
-        let editable = selected.is_some() && !protected;
+        let recovery_failed = selected.is_some_and(|target| {
+            self.protection_for(target)
+                .is_some_and(|p| p.recovery_failed)
+        });
+        let editable =
+            (selected.is_some() || self.editing_rule.is_some()) && self.calibration.is_none();
         let parameters_enabled = editable && self.mouse_shield;
         let validation = self.options(cx);
-        let can_protect = editable && (self.system_menu || self.mouse_shield) && validation.is_ok();
+        let can_protect = selected.is_some()
+            && editable
+            && (self.system_menu || self.mouse_shield)
+            && validation.is_ok();
         let count = self.table.read(cx).delegate().rows.len();
         let filtering = !self.search.read(cx).value().trim().is_empty();
         let count_label = if filtering {
@@ -561,7 +984,7 @@ impl Render for KeepWindow {
             };
         let action_hint = match selected {
             Some(target) if protected => {
-                format!("解除“{}”的保护，随后可修改参数。", target.display_title())
+                format!("解除“{}”的保护。", target.display_title())
             }
             Some(target) => format!("将当前设置应用于“{}”。", target.display_title()),
             None => "请先在表格中选择一个窗口。".into(),
@@ -627,6 +1050,7 @@ impl Render for KeepWindow {
                 let restore_disabled = view.read(cx).protections.is_empty();
                 menu.item(PopupMenuItem::new("恢复全部窗口").icon(IconName::RotateCcw).disabled(restore_disabled)
                     .on_click(window.listener_for(&view, |this, _, _, cx| this.restore_all(cx))))
+                    .item(PopupMenuItem::new("应用规则管理").on_click(window.listener_for(&view, |this, _, _, cx| { this.rules_open = !this.rules_open; cx.notify(); })))
                     .separator()
                     .item(PopupMenuItem::new("退出并恢复").icon(IconName::LogOut)
                         .on_click(window.listener_for(&view, |this, _, _, cx| this.exit(cx))))
@@ -644,16 +1068,17 @@ impl Render for KeepWindow {
             .child(
                 div().flex().items_center().justify_between().gap_3()
                     .child(div().flex().items_center().gap_5()
-                        .child(div().id("system-help").tooltip(|window, cx| Tooltip::new("禁用标准标题栏和系统菜单的关闭命令。已保护窗口需先解除保护才能修改。" ).build(window, cx)).child(
+                        .child(div().id("system-help").tooltip(|window, cx| Tooltip::new("禁用标准标题栏和系统菜单的关闭命令；修改后点击应用设置。" ).build(window, cx)).child(
                             Checkbox::new("system-menu").label("系统关闭保护").checked(self.system_menu).disabled(!editable)
                                 .on_change(cx.listener(|this, value, _, cx| { this.system_menu = *value; cx.notify(); }))))
-                        .child(div().id("shield-help").tooltip(|window, cx| Tooltip::new("拦截关闭按钮区域的鼠标点击，适用于自绘标题栏。已保护窗口需先解除保护才能修改。" ).build(window, cx)).child(
+                        .child(div().id("shield-help").tooltip(|window, cx| Tooltip::new("拦截关闭按钮区域的鼠标点击；修改后点击应用设置。" ).build(window, cx)).child(
                             Checkbox::new("mouse-shield").label("鼠标遮罩").checked(self.mouse_shield).disabled(!editable)
                                 .on_change(cx.listener(|this, value, _, cx| { this.mouse_shield = *value; cx.notify(); })))))
+                    .child(Button::new("apply").label("应用设置").disabled(!protected || !can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx))))
                     .child(Button::new("toggle-protection").primary()
                         .icon(if protected { IconName::RotateCcw } else { IconName::ShieldCheck })
-                        .label(if protected { "解除保护" } else { "开启保护" })
-                        .tooltip(action_hint).disabled(!protected && !can_protect)
+                        .label(if selected.is_some_and(|target| self.protection_for(target).is_some_and(|p| p.recovery_failed)) { "重试恢复" } else if protected { "解除保护" } else { "开启保护 / 重试" })
+                        .tooltip(action_hint).disabled(self.calibration.is_some() || (!protected && !can_protect))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let protected = this.selected.as_ref().is_some_and(|target| this.protection_for(target).is_some());
                             if protected { this.restore_selected(cx); } else { this.protect(cx); }
@@ -664,7 +1089,93 @@ impl Render for KeepWindow {
                     .child(div().id("dip-help").text_xs().text_color(theme.muted_foreground).flex_shrink_0()
                         .tooltip(|window, cx| Tooltip::new("DIP 是逻辑像素，实际遮罩像素按目标窗口的 DPI 缩放。" ).build(window, cx)).child("DIP")),
             ))
+            .when(self.mouse_shield, |config| config.child(div().flex().items_center().gap_3()
+                .child(div().text_sm().child("透明度 %"))
+                .child(div().w(px(90.)).child(NumberInput::new(&self.opacity).small().disabled(!editable)))
+                .child(Button::new("calibrate").label("校准遮罩").disabled(!can_protect || !self.mouse_shield || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.start_calibration(cx))))))
+            .child(div().flex().items_center().gap_2()
+                .child(div().flex_1().min_w_0().child(Input::new(&self.title_contains).small().disabled(!editable)))
+                .child(Checkbox::new("automatic").label("自动保护新窗口").checked(self.automatic).disabled(!editable).on_change(cx.listener(|this, checked, _, cx| { this.automatic = *checked; cx.notify(); })))
+                .child(Button::new("save-rule").label(if self.editing_rule.is_some() { "保存规则修改" } else { "保存为应用规则" }).disabled(!editable || validation_error.is_some() || self.editing_rule.is_none() && selected.is_none_or(|target| self.path_for(target).is_none())).on_click(cx.listener(|this, _, _, cx| this.save_rule(cx)))))
+            .when_some(self.config_error.clone(), |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)))
             .when_some(validation_error, |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)));
+
+        let rules = div()
+            .id("rule-list")
+            .flex_1()
+            .min_h_0()
+            .v_flex()
+            .gap_2()
+            .overflow_y_scroll()
+            .children(self.config.rules.iter().enumerate().map(|(index, rule)| {
+                let label = format!(
+                    "{} · {} · {}",
+                    rule.path.rsplit('\\').next().unwrap_or(&rule.path),
+                    rule.class,
+                    if rule.title_contains.is_empty() {
+                        "所有同类窗口"
+                    } else {
+                        &rule.title_contains
+                    }
+                );
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().flex_1().min_w_0().truncate().text_sm().child(label))
+                    .child(
+                        Button::new(("edit-rule", index))
+                            .small()
+                            .label("编辑")
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.edit_rule(index, window, cx)
+                            })),
+                    )
+                    .child(
+                        Button::new(("disable-rule", index))
+                            .small()
+                            .label(if rule.automatic {
+                                "禁用自动"
+                            } else {
+                                "启用自动"
+                            })
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut config = this.config.clone();
+                                config.rules[index].automatic = !config.rules[index].automatic;
+                                this.commit_config(config);
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(("delete-rule", index))
+                            .small()
+                            .label("删除")
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut config = this.config.clone();
+                                config.rules.remove(index);
+                                this.commit_config(config);
+                                this.editing_rule = None;
+                                cx.notify();
+                            })),
+                    )
+            }))
+            .when(self.config.rules.is_empty(), |list| {
+                list.child(div().text_sm().child("暂无规则，选中窗口后保存应用规则。"))
+            });
+        let table = div()
+            .flex_1()
+            .min_h(px(110.))
+            .rounded(px(8.))
+            .border_1()
+            .border_color(theme.border)
+            .bg(theme.table)
+            .overflow_hidden()
+            .child(
+                DataTable::new(&self.table)
+                    .bordered(false)
+                    .with_size(px(32.))
+                    .header_row_height(px(30.)),
+            );
 
         div()
             .size_full()
@@ -680,22 +1191,22 @@ impl Render for KeepWindow {
                     .gap_3()
                     .p_4()
                     .child(toolbar)
-                    .child(
+                    .child(if self.rules_open {
                         div()
                             .flex_1()
                             .min_h(px(110.))
-                            .rounded(px(8.))
-                            .border_1()
-                            .border_color(theme.border)
-                            .bg(theme.table)
-                            .overflow_hidden()
+                            .v_flex()
+                            .gap_2()
                             .child(
-                                DataTable::new(&self.table)
-                                    .bordered(false)
-                                    .with_size(px(32.))
-                                    .header_row_height(px(30.)),
-                            ),
-                    )
+                                div()
+                                    .text_sm()
+                                    .child("应用规则 · 编辑参数后点击保存规则修改"),
+                            )
+                            .child(rules)
+                            .into_any_element()
+                    } else {
+                        table.into_any_element()
+                    })
                     .child(config),
             )
             .child(
@@ -734,14 +1245,31 @@ impl Render for KeepWindow {
 }
 
 pub fn run() {
+    let background = std::env::args().any(|arg| arg == "--background");
+    let _instance = match crate::instance::Instance::acquire(background) {
+        Ok(Some(instance)) => instance,
+        Ok(None) => return,
+        Err(error) => {
+            unsafe {
+                let text = window::wide(&error);
+                windows::Win32::UI::WindowsAndMessaging::MessageBoxW(
+                    None,
+                    windows::core::PCWSTR(text.as_ptr()),
+                    windows::core::w!("KeepWindow"),
+                    windows::Win32::UI::WindowsAndMessaging::MB_OK
+                        | windows::Win32::UI::WindowsAndMessaging::MB_ICONERROR,
+                );
+            }
+            return;
+        }
+    };
     gpui_kit::application()
         .with_assets(gpui_kit::assets::AllAssets)
-        .run(|cx| {
+        .run(move |cx| {
             gpui_kit::init(cx);
             ui::init_theme(cx);
             crate::protection::register_overlay_class()
                 .expect("failed to register shield window class");
-            let background = std::env::args().any(|arg| arg == "--background");
             let options = WindowOptions {
                 show: !background,
                 focus: !background,
@@ -750,7 +1278,7 @@ pub fn run() {
                     size(px(860.), px(620.)),
                     cx,
                 ))),
-                window_min_size: Some(size(px(740.), px(420.))),
+                window_min_size: Some(size(px(740.), px(540.))),
                 ..WindowOptions::default()
             };
             let (handle, view) = gpui_kit::open_window(options, cx, |window, cx| {

@@ -28,7 +28,8 @@ use crate::{
 
 const OVERLAY_CLASS: PCWSTR = w!("KeepWindow.CloseShield");
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(default)]
 pub struct Options {
     pub system_menu: bool,
     pub mouse_shield: bool,
@@ -36,6 +37,7 @@ pub struct Options {
     pub height: i32,
     pub right_offset: i32,
     pub top_offset: i32,
+    pub opacity: i32,
 }
 
 impl Default for Options {
@@ -47,7 +49,67 @@ impl Default for Options {
             height: 32,
             right_offset: 0,
             top_offset: 0,
+            opacity: 28,
         }
+    }
+}
+
+impl Options {
+    pub fn validate(&self) -> Result<(), String> {
+        if !self.system_menu && !self.mouse_shield {
+            return Err("请至少启用一种保护方式。".into());
+        }
+        if !(1..=512).contains(&self.width)
+            || !(1..=512).contains(&self.height)
+            || !(-512..=512).contains(&self.right_offset)
+            || !(-512..=512).contains(&self.top_offset)
+            || !(5..=80).contains(&self.opacity)
+        {
+            return Err("遮罩尺寸、偏移或透明度超出允许范围。".into());
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ProtectionStatus {
+    pub system_menu: bool,
+    pub mouse_shield: bool,
+    pub recovery_failed: bool,
+    pub error: Option<String>,
+}
+
+impl ProtectionStatus {
+    pub fn label(&self) -> &'static str {
+        if self.recovery_failed {
+            "恢复失败"
+        } else {
+            match (self.system_menu, self.mouse_shield) {
+                (true, true) => "组合保护",
+                (true, false) => "系统保护",
+                (false, true) => "鼠标保护",
+                _ => "未保护",
+            }
+        }
+    }
+    pub fn description(&self) -> String {
+        let mut text = format!(
+            "系统保护：{}；鼠标保护：{}（需确认覆盖位置）",
+            if self.system_menu {
+                "生效"
+            } else {
+                "未生效"
+            },
+            if self.mouse_shield {
+                "生效"
+            } else {
+                "未生效"
+            }
+        );
+        if let Some(error) = &self.error {
+            text.push_str(&format!("；{error}"));
+        }
+        text
     }
 }
 
@@ -63,13 +125,14 @@ pub struct Protection {
     overlay: Option<HWND>,
     mouse: Option<MouseRegistration>,
     marker: Vec<u16>,
+    pub recovery_failed: bool,
+    pub error: Option<String>,
+    pub calibrating: bool,
 }
 
 impl Protection {
     pub fn start(target: WindowInfo, options: Options) -> Result<Self, String> {
-        if !options.system_menu && !options.mouse_shield {
-            return Err("请至少启用一种保护方式。".into());
-        }
+        options.validate()?;
         if !target.is_same_window() {
             return Err("目标窗口已关闭，请刷新窗口列表。".into());
         }
@@ -89,6 +152,9 @@ impl Protection {
             overlay: None,
             mouse: None,
             marker,
+            recovery_failed: false,
+            error: None,
+            calibrating: false,
         };
         unsafe {
             // A property disappears with the window, so a recycled HWND is never restored or shielded.
@@ -101,11 +167,15 @@ impl Protection {
                 && unsafe { GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) } != u32::MAX;
             if has_close || !options.mouse_shield {
                 protection.menu = Some(disable_close(protection.target.hwnd)?);
+            } else {
+                protection.error = Some("目标没有标准关闭项，仅鼠标保护生效。".into());
             }
         }
         if options.mouse_shield {
-            protection.overlay =
-                Some(create_overlay().map_err(|error| format!("无法创建鼠标遮罩：{error}"))?);
+            protection.overlay = Some(
+                create_overlay(options.opacity)
+                    .map_err(|error| format!("无法创建鼠标遮罩：{error}"))?,
+            );
             protection.mouse = Some(MouseRegistration::new(
                 protection.target.hwnd,
                 protection.overlay,
@@ -120,6 +190,140 @@ impl Protection {
     pub fn alive(&self) -> bool {
         self.target.is_same_window()
             && unsafe { GetPropW(self.target.hwnd, PCWSTR(self.marker.as_ptr())).0 as usize == 1 }
+    }
+
+    pub fn status(&self) -> ProtectionStatus {
+        let system_menu = self.menu.as_ref().is_some_and(|menu| unsafe {
+            self.alive() && GetSystemMenu(self.target.hwnd, false) == menu.menu && {
+                let state = GetMenuState(menu.menu, SC_CLOSE, MF_BYCOMMAND);
+                state != u32::MAX && state & (MF_DISABLED.0 | MF_GRAYED.0) != 0
+            }
+        });
+        ProtectionStatus {
+            system_menu,
+            mouse_shield: self.mouse.is_some() && self.alive(),
+            recovery_failed: self.recovery_failed,
+            error: self.error.clone(),
+        }
+    }
+
+    pub fn update_options(&mut self, options: Options) -> Result<(), String> {
+        options.validate()?;
+        if !self.alive() {
+            return Err("目标窗口已关闭。".into());
+        }
+        if self.recovery_failed {
+            return Err("请先重试恢复，再开启保护。".into());
+        }
+        if options.mouse_shield {
+            shield_rect(self.target.hwnd, options)?;
+        }
+        // Prepare fallible mouse resources before changing the system menu.
+        let mut new_overlay = None;
+        let mut new_mouse = None;
+        if options.mouse_shield && self.mouse.is_none() {
+            let overlay = create_overlay(options.opacity).map_err(|e| e.to_string())?;
+            match MouseRegistration::new(self.target.hwnd, Some(overlay), &self.marker, options) {
+                Ok(mouse) => {
+                    new_overlay = Some(overlay);
+                    new_mouse = Some(mouse);
+                }
+                Err(error) => {
+                    unsafe {
+                        let _ = DestroyWindow(overlay);
+                    }
+                    return Err(error);
+                }
+            }
+        }
+        if options.mouse_shield
+            && let Some(overlay) = self.overlay
+        {
+            unsafe {
+                SetLayeredWindowAttributes(
+                    overlay,
+                    COLORREF(0),
+                    (options.opacity * 255 / 100) as u8,
+                    LWA_ALPHA,
+                )
+            }
+            .map_err(|e| format!("无法更新遮罩透明度：{e}"))?;
+        }
+        let result = (|| {
+            let mut new_menu = None;
+            if options.system_menu && self.menu.is_none() {
+                let menu = unsafe { GetSystemMenu(self.target.hwnd, false) };
+                let has_close = !menu.0.is_null()
+                    && unsafe { GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND) } != u32::MAX;
+                if has_close || !options.mouse_shield {
+                    new_menu = Some(disable_close(self.target.hwnd)?);
+                }
+            }
+            if !options.system_menu
+                && let Some(menu) = &self.menu
+            {
+                set_close_state(self.target.hwnd, menu.menu, menu.original_disabled)?;
+                self.menu = None;
+            }
+            if new_menu.is_some() {
+                self.menu = new_menu;
+            }
+            Ok::<(), String>(())
+        })();
+        if let Err(error) = result {
+            drop(new_mouse);
+            if let Some(overlay) = new_overlay {
+                unsafe {
+                    let _ = DestroyWindow(overlay);
+                }
+            }
+            if let Some(overlay) = self.overlay {
+                unsafe {
+                    let _ = SetLayeredWindowAttributes(
+                        overlay,
+                        COLORREF(0),
+                        (self.options.opacity * 255 / 100) as u8,
+                        LWA_ALPHA,
+                    );
+                }
+            }
+            self.error = Some(error.clone());
+            return Err(error);
+        }
+        if !options.mouse_shield {
+            self.mouse = None;
+            if let Some(overlay) = self.overlay.take() {
+                unsafe {
+                    let _ = DestroyWindow(overlay);
+                }
+            }
+        } else {
+            if let Some(overlay) = new_overlay {
+                self.overlay = Some(overlay);
+                self.mouse = new_mouse;
+            }
+            if let Some(mouse) = &self.mouse {
+                mouse.update(options);
+            }
+        }
+        self.options = options;
+        self.error = (options.system_menu && self.menu.is_none())
+            .then(|| "目标没有标准关闭项，仅鼠标保护生效。".into());
+        Ok(())
+    }
+
+    pub fn set_calibration(&mut self, hwnd: Option<HWND>) {
+        self.calibrating = hwnd.is_some();
+        if let Some(mouse) = &self.mouse {
+            mouse.set_calibration(hwnd);
+        }
+        if self.calibrating
+            && let Some(overlay) = self.overlay
+        {
+            unsafe {
+                let _ = ShowWindow(overlay, SW_HIDE);
+            }
+        }
     }
 
     pub fn tick(&mut self) -> Result<(), String> {
@@ -144,7 +348,8 @@ impl Protection {
             unsafe {
                 let foreground = GetForegroundWindow();
                 let active = GetAncestor(foreground, GA_ROOT) == self.target.hwnd;
-                if !active
+                if self.calibrating
+                    || !active
                     || IsIconic(self.target.hwnd).as_bool()
                     || !IsWindowVisible(self.target.hwnd).as_bool()
                     || is_cloaked(self.target.hwnd)
@@ -169,6 +374,13 @@ impl Protection {
     }
 
     pub fn restore(&mut self) -> Result<(), String> {
+        self.restore_with(set_close_state)
+    }
+
+    fn restore_with(
+        &mut self,
+        set_state: impl FnOnce(HWND, HMENU, MENU_ITEM_FLAGS) -> Result<(), String>,
+    ) -> Result<(), String> {
         self.mouse = None;
         if let Some(overlay) = self.overlay.take() {
             unsafe {
@@ -177,14 +389,19 @@ impl Protection {
         }
         if !self.alive() {
             self.menu = None;
+            self.recovery_failed = false;
             return Ok(());
         }
         if let Some(menu) = &self.menu {
             unsafe {
                 if GetSystemMenu(self.target.hwnd, false) == menu.menu
                     && GetMenuState(menu.menu, SC_CLOSE, MF_BYCOMMAND) != u32::MAX
+                    && let Err(error) =
+                        set_state(self.target.hwnd, menu.menu, menu.original_disabled)
                 {
-                    set_close_state(self.target.hwnd, menu.menu, menu.original_disabled)?;
+                    self.recovery_failed = true;
+                    self.error = Some(error.clone());
+                    return Err(error);
                 }
             }
             self.menu = None;
@@ -192,6 +409,7 @@ impl Protection {
         unsafe {
             let _ = RemovePropW(self.target.hwnd, PCWSTR(self.marker.as_ptr()));
         }
+        self.recovery_failed = false;
         Ok(())
     }
 }
@@ -323,7 +541,7 @@ pub fn register_overlay_class() -> windows::core::Result<()> {
     }
 }
 
-fn create_overlay() -> windows::core::Result<HWND> {
+fn create_overlay(opacity: i32) -> windows::core::Result<HWND> {
     unsafe {
         // Deliberately omit WS_EX_TRANSPARENT: the shield must consume mouse clicks.
         let hwnd = CreateWindowExW(
@@ -340,7 +558,9 @@ fn create_overlay() -> windows::core::Result<HWND> {
             Some(GetModuleHandleW(None)?.into()),
             None,
         )?;
-        if let Err(error) = SetLayeredWindowAttributes(hwnd, COLORREF(0), 72, LWA_ALPHA) {
+        if let Err(error) =
+            SetLayeredWindowAttributes(hwnd, COLORREF(0), (opacity * 255 / 100) as u8, LWA_ALPHA)
+        {
             let _ = DestroyWindow(hwnd);
             return Err(error);
         }
@@ -387,6 +607,107 @@ mod tests {
     };
 
     struct TestProcess(Child);
+
+    #[test]
+    fn live_updates_switch_components_and_preserve_original_menu_state() {
+        let _ = register_overlay_class();
+        unsafe {
+            let target = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Live options test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                500,
+                300,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap();
+            let mut guard = Protection::start(
+                WindowInfo::inspect(target).unwrap(),
+                Options {
+                    mouse_shield: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            assert_eq!(guard.status().label(), "系统保护");
+            guard
+                .update_options(Options {
+                    width: 80,
+                    opacity: 45,
+                    ..Default::default()
+                })
+                .unwrap();
+            assert_eq!(guard.status().label(), "组合保护");
+            assert_eq!(guard.options.width, 80);
+            let failure = guard.restore_with(|_, _, _| Err("injected menu restore failure".into()));
+            assert!(failure.is_err());
+            assert_eq!(guard.status().label(), "恢复失败");
+            assert!(guard.status().system_menu);
+            assert!(!guard.status().mouse_shield);
+            guard.restore().unwrap();
+            guard = Protection::start(WindowInfo::inspect(target).unwrap(), Options::default())
+                .unwrap();
+            let previous = guard.options;
+            assert!(
+                guard
+                    .update_options(Options {
+                        width: 0,
+                        ..previous
+                    })
+                    .is_err()
+            );
+            assert_eq!(guard.options, previous);
+            guard
+                .update_options(Options {
+                    system_menu: false,
+                    ..previous
+                })
+                .unwrap();
+            assert_eq!(guard.status().label(), "鼠标保护");
+            assert_eq!(
+                GetMenuState(GetSystemMenu(target, false), SC_CLOSE, MF_BYCOMMAND)
+                    & (MF_DISABLED.0 | MF_GRAYED.0),
+                0
+            );
+            guard.restore().unwrap();
+            DestroyWindow(target).unwrap();
+        }
+    }
+
+    #[test]
+    fn missing_menu_reports_only_actual_mouse_protection() {
+        let _ = register_overlay_class();
+        unsafe {
+            let target = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("No system menu"),
+                WS_POPUP,
+                0,
+                0,
+                500,
+                300,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap();
+            let mut guard =
+                Protection::start(WindowInfo::inspect(target).unwrap(), Options::default())
+                    .unwrap();
+            assert_eq!(guard.status().label(), "鼠标保护");
+            assert!(guard.status().error.is_some());
+            guard.restore().unwrap();
+            DestroyWindow(target).unwrap();
+        }
+    }
 
     impl Drop for TestProcess {
         fn drop(&mut self) {
@@ -569,7 +890,7 @@ mod tests {
 
     #[test]
     fn shield_consumes_mouse_without_activation_and_is_destroyed_on_restore() {
-        register_overlay_class().unwrap();
+        let _ = register_overlay_class();
         unsafe {
             let target = CreateWindowExW(
                 WINDOW_EX_STYLE(0),

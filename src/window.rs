@@ -2,15 +2,18 @@ use std::mem::size_of;
 
 use windows::{
     Win32::{
-        Foundation::{HWND, LPARAM, RECT},
+        Foundation::{CloseHandle, HWND, LPARAM, RECT},
         Graphics::Dwm::{DWMWA_CLOAKED, DwmGetWindowAttribute},
-        System::Threading::GetCurrentProcessId,
+        System::Threading::{
+            GetCurrentProcessId, OpenProcess, PROCESS_NAME_WIN32,
+            PROCESS_QUERY_LIMITED_INFORMATION, QueryFullProcessImageNameW,
+        },
         UI::WindowsAndMessaging::{
             EnumWindows, GetClassNameW, GetShellWindow, GetWindowTextW, GetWindowThreadProcessId,
             IsWindow, IsWindowVisible,
         },
     },
-    core::{BOOL, Result},
+    core::{BOOL, PWSTR, Result},
 };
 
 pub fn wide(text: &str) -> Vec<u16> {
@@ -128,6 +131,38 @@ pub fn enumerate() -> Result<Vec<WindowInfo>> {
 
 pub fn valid_rect(rect: RECT) -> bool {
     rect.right > rect.left && rect.bottom > rect.top
+}
+
+pub fn process_path(pid: u32) -> Option<String> {
+    unsafe {
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut buffer = vec![0u16; 32768];
+        let mut length = buffer.len() as u32;
+        let result = QueryFullProcessImageNameW(
+            process,
+            PROCESS_NAME_WIN32,
+            PWSTR(buffer.as_mut_ptr()),
+            &mut length,
+        );
+        let _ = CloseHandle(process);
+        result.ok()?;
+        Some(String::from_utf16_lossy(&buffer[..length as usize]))
+    }
+}
+
+pub fn process_creation(pid: u32) -> Option<u64> {
+    unsafe {
+        use windows::Win32::{Foundation::FILETIME, System::Threading::GetProcessTimes};
+        let process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, pid).ok()?;
+        let mut creation = FILETIME::default();
+        let mut exit = FILETIME::default();
+        let mut kernel = FILETIME::default();
+        let mut user = FILETIME::default();
+        let result = GetProcessTimes(process, &mut creation, &mut exit, &mut kernel, &mut user);
+        let _ = CloseHandle(process);
+        result.ok()?;
+        Some((u64::from(creation.dwHighDateTime) << 32) | u64::from(creation.dwLowDateTime))
+    }
 }
 
 pub fn retain_selection(

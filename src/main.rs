@@ -3,7 +3,13 @@
 #[cfg(windows)]
 mod app;
 #[cfg(windows)]
+mod calibration;
+#[cfg(windows)]
+mod config;
+#[cfg(windows)]
 mod icon;
+#[cfg(windows)]
+mod instance;
 #[cfg(windows)]
 mod mouse;
 #[cfg(windows)]
