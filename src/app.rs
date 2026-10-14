@@ -60,6 +60,7 @@ pub struct KeepWindow {
     startup_enabled: bool,
     config_error: Option<String>,
     rules_open: bool,
+    rule_settings_open: bool,
     editing_rule: Option<usize>,
     suppressed: Vec<WindowInfo>,
     attempts: Vec<(WindowInfo, Rule, Option<String>)>,
@@ -165,8 +166,8 @@ impl KeepWindow {
                 .min(5.)
                 .max(80.)
         });
-        let title_contains = cx
-            .new(|cx| InputState::new(window, cx).placeholder("标题包含（留空匹配所有同类窗口）"));
+        let title_contains =
+            cx.new(|cx| InputState::new(window, cx).placeholder("标题关键词（可选）"));
         let (store, config, config_error) = Store::load();
         let table = cx.new(|cx| {
             TableState::new(WindowTable::new(), window, cx)
@@ -268,6 +269,7 @@ impl KeepWindow {
             startup_enabled: false,
             config_error,
             rules_open: false,
+            rule_settings_open: false,
             editing_rule: None,
             suppressed: Vec::new(),
             attempts: Vec::new(),
@@ -856,6 +858,7 @@ impl KeepWindow {
         });
         self.automatic = rule.automatic;
         self.editing_rule = Some(index);
+        self.rule_settings_open = true;
         self.status = "正在编辑已保存规则，点击保存完成修改。".into();
         cx.notify();
     }
@@ -1142,23 +1145,25 @@ impl Render for KeepWindow {
                 })
             });
         let view = cx.entity();
+        let control_height = px(30.);
+        let number_width = px(96.);
         let fields = [
-            ("width-field", "宽度", &self.width, "遮罩宽度：1–512 DIP。"),
             (
-                "height-field",
-                "高度",
-                &self.height,
-                "遮罩高度：1–512 DIP。",
+                "width-field",
+                "宽",
+                &self.width,
+                "遮罩宽度：1–512 DIP，按目标窗口 DPI 缩放。",
             ),
+            ("height-field", "高", &self.height, "遮罩高度：1–512 DIP。"),
             (
                 "right-field",
-                "右侧内缩",
+                "内缩",
                 &self.right_offset,
                 "右侧内缩：−512–512 DIP。正值向左，负值向右。",
             ),
             (
                 "top-field",
-                "顶部下移",
+                "下移",
                 &self.top_offset,
                 "顶部下移：−512–512 DIP。正值向下，负值向上。",
             ),
@@ -1167,18 +1172,18 @@ impl Render for KeepWindow {
         .map(|(id, label, state, hint)| {
             div()
                 .id(id)
-                .flex_1()
-                .min_w_0()
                 .flex()
+                .flex_shrink_0()
                 .items_center()
-                .gap_2()
+                .gap(px(6.))
+                .h(control_height)
                 .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
                 .child(div().text_sm().flex_shrink_0().child(label))
                 .child(
-                    div().flex_1().min_w_0().child(
+                    div().w(number_width).flex_shrink_0().child(
                         NumberInput::new(state)
                             .small()
-                            .h(px(30.))
+                            .h(control_height)
                             .disabled(!parameters_enabled),
                     ),
                 )
@@ -1213,27 +1218,31 @@ impl Render for KeepWindow {
 
         let config = div()
             .v_flex()
-            .gap_2()
+            .gap_3()
             .p_3()
             .flex_shrink_0()
             .rounded(px(8.))
             .border_1()
             .border_color(theme.border)
             .bg(theme.table)
-            .when_some(identity_label, |config, label| config.child(div().id("target-identity").text_xs().text_color(theme.muted_foreground).truncate().child(label.clone()).tooltip(move |window, cx| Tooltip::new(label.clone()).build(window, cx))))
             .child(
-                div().flex().items_center().justify_between().gap_3()
-                    .child(div().flex().items_center().gap_5()
-                        .child(div().id("system-help").tooltip(|window, cx| Tooltip::new("禁用标准标题栏和系统菜单的关闭命令；修改后点击应用设置。" ).build(window, cx)).child(
-                            Checkbox::new("system-menu").label("系统关闭保护").checked(self.system_menu).disabled(!editable)
-                                .on_change(cx.listener(|this, value, _, cx| { this.system_menu = *value; cx.notify(); }))))
-                        .child(div().id("shield-help").tooltip(|window, cx| Tooltip::new("拦截关闭按钮区域的鼠标点击；修改后点击应用设置。" ).build(window, cx)).child(
-                            Checkbox::new("mouse-shield").label("鼠标遮罩").checked(self.mouse_shield).disabled(!editable)
-                                .on_change(cx.listener(|this, value, _, cx| { this.mouse_shield = *value; cx.notify(); })))))
-                    .child(Button::new("apply").label("应用设置").disabled(!protected || !can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx))))
-                    .child(Button::new("toggle-protection").primary()
+                div().flex().items_center().gap_2()
+                    .child(div().flex().items_center().gap_4().flex_shrink_0()
+                        .child(Checkbox::new("system-menu").small().h(control_height).items_center().label("系统保护").checked(self.system_menu).disabled(!editable)
+                            .tooltip("禁用标准标题栏和系统菜单的关闭命令。修改后点击“应用”。")
+                            .on_change(cx.listener(|this, value, _, cx| { this.system_menu = *value; cx.notify(); })))
+                        .child(Checkbox::new("mouse-shield").small().h(control_height).items_center().label("鼠标遮罩").checked(self.mouse_shield).disabled(!editable)
+                            .tooltip("拦截遮罩区域内的鼠标点击，可用“校准”调整位置。修改后点击“应用”。")
+                            .on_change(cx.listener(|this, value, _, cx| { this.mouse_shield = *value; cx.notify(); }))))
+                    .when_some(identity_label, |row, label| row.child(Button::new("target-identity").ghost().small().h(control_height).icon(IconName::Info).accessibility_label("目标窗口信息").tooltip(label)))
+                    .child(div().flex_1())
+                    .child(Button::new("rule-settings").ghost().small().h(control_height).label("规则").icon(if self.rule_settings_open { IconName::ChevronUp } else { IconName::ChevronDown })
+                        .tooltip(if self.rule_settings_open { "收起规则设置" } else { "展开标题匹配、自动保护和保存规则" }).disabled(!editable && !self.rule_settings_open)
+                        .on_click(cx.listener(|this, _, _, cx| { this.rule_settings_open = !this.rule_settings_open; cx.notify(); })))
+                    .when(protected, |row| row.child(Button::new("apply").small().h(control_height).label("应用").tooltip("将修改后的设置应用到当前窗口").disabled(!can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx)))))
+                    .child(Button::new("toggle-protection").primary().small().h(control_height).flex_shrink_0()
                         .icon(if protected { IconName::RotateCcw } else { IconName::ShieldCheck })
-                        .label(if selected.is_some_and(|target| self.protection_for(target).is_some_and(|p| p.recovery_failed)) { "重试恢复" } else if protected { "解除保护" } else { "开启保护 / 重试" })
+                        .label(if recovery_failed { "重试恢复" } else if protected { "解除保护" } else { "开启保护" })
                         .tooltip(action_hint).disabled(self.calibration.is_some() || self.picker.is_some() || (!protected && !can_protect))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let protected = this.selected.as_ref().is_some_and(|target| this.protection_for(target).is_some());
@@ -1241,18 +1250,25 @@ impl Render for KeepWindow {
                         })))
             )
             .when(self.mouse_shield, |config| config.child(
-                div().flex().items_center().gap_2().children(fields)
-                    .child(div().id("dip-help").text_xs().text_color(theme.muted_foreground).flex_shrink_0()
-                        .tooltip(|window, cx| Tooltip::new("DIP 是逻辑像素，实际遮罩像素按目标窗口的 DPI 缩放。" ).build(window, cx)).child("DIP")),
+                div().flex().flex_wrap().items_center().gap_x_3().gap_y_2().children(fields)
+                    .child(div().flex().items_center().gap_3().flex_shrink_0()
+                        .child(div().id("opacity-field").flex().items_center().gap(px(6.)).h(control_height)
+                            .tooltip(|window, cx| Tooltip::new("遮罩透明度：5–80%。数值越小，遮罩越透明。").build(window, cx))
+                            .child(div().text_sm().child("透明度"))
+                            .child(div().w(number_width).flex_shrink_0().child(NumberInput::new(&self.opacity).small().h(control_height).disabled(!parameters_enabled))))
+                        .child(Button::new("calibrate").small().h(control_height).label("校准").tooltip("拖动遮罩调整位置和大小；Enter 保存，Esc 取消")
+                            .disabled(!can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.start_calibration(cx)))))
             ))
-            .when(self.mouse_shield, |config| config.child(div().flex().items_center().gap_3()
-                .child(div().text_sm().child("透明度 %"))
-                .child(div().w(px(90.)).child(NumberInput::new(&self.opacity).small().disabled(!editable)))
-                .child(Button::new("calibrate").label("校准遮罩").disabled(!can_protect || !self.mouse_shield || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.start_calibration(cx))))))
-            .child(div().flex().items_center().gap_2()
-                .child(div().flex_1().min_w_0().child(Input::new(&self.title_contains).small().disabled(!editable)))
-                .child(Checkbox::new("automatic").label("自动保护新窗口").checked(self.automatic).disabled(!editable).on_change(cx.listener(|this, checked, _, cx| { this.automatic = *checked; cx.notify(); })))
-                .child(Button::new("save-rule").label(if self.editing_rule.is_some() { "保存规则修改" } else { "保存为应用规则" }).disabled(!editable || validation_error.is_some() || self.editing_rule.is_none() && selected.is_none_or(|target| self.path_for(target).is_none())).on_click(cx.listener(|this, _, _, cx| this.save_rule(cx)))))
+            .when(self.rule_settings_open, |config| config.child(div().flex().items_center().gap_3().pt_3().border_t_1().border_color(theme.border)
+                .child(div().id("title-match-help").flex_1().min_w_0()
+                    .tooltip(|window, cx| Tooltip::new("规则按程序路径和窗口类名匹配。标题关键词留空时匹配所有同类窗口。").build(window, cx))
+                    .child(Input::new(&self.title_contains).small().h(control_height).aria_label("规则标题关键词").disabled(!editable)))
+                .child(Checkbox::new("automatic").small().h(control_height).items_center().label("自动保护").checked(self.automatic).disabled(!editable)
+                    .tooltip("保存后，自动保护匹配规则的新窗口")
+                    .on_change(cx.listener(|this, checked, _, cx| { this.automatic = *checked; cx.notify(); })))
+                .child(Button::new("save-rule").small().h(control_height).label("保存规则").tooltip("保存程序、窗口类名、标题条件和当前保护参数")
+                    .disabled(!editable || validation_error.is_some() || self.editing_rule.is_none() && selected.is_none_or(|target| self.path_for(target).is_none()))
+                    .on_click(cx.listener(|this, _, _, cx| this.save_rule(cx))))))
             .when_some(self.config_error.clone(), |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)))
             .when_some(validation_error, |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)));
 
@@ -1353,11 +1369,7 @@ impl Render for KeepWindow {
                             .min_h(px(110.))
                             .v_flex()
                             .gap_2()
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .child("应用规则 · 编辑参数后点击保存规则修改"),
-                            )
+                            .child(div().text_sm().child("应用规则"))
                             .child(rules)
                             .into_any_element()
                     } else {
