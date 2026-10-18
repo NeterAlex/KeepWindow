@@ -1,6 +1,6 @@
 use std::time::{Duration, Instant};
 
-use crate::{config::Rule, protection::Options, recovery::Identity, window::WindowInfo};
+use crate::{config::Rule, protection::Options, recovery::ReleaseMarker, window::WindowInfo};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum FailureKind {
@@ -57,9 +57,15 @@ impl Attempt {
 
 pub struct Release {
     pub target: WindowInfo,
-    pub identity: Identity,
+    pub marker: ReleaseMarker,
     pub options: Options,
     pub deadline: Instant,
+}
+
+impl Release {
+    pub fn matches(&self, target: &WindowInfo) -> bool {
+        self.target.same_identity(target) && self.marker.is_current()
+    }
 }
 
 #[cfg(test)]

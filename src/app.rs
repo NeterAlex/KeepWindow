@@ -74,6 +74,7 @@ pub struct KeepWindow {
     events: Events,
     events_open: bool,
     include_private: bool,
+    exporting_diagnostic: bool,
     rule_name: Entity<InputState>,
     transfer_path: Entity<InputState>,
     imported: Option<Vec<Rule>>,
@@ -126,9 +127,8 @@ impl KeepWindow {
         crate::locale::set(language);
         let mut config = self.config.clone();
         config.language = Some(language.code().to_string());
-        match self.store.save(&config) {
+        match self.persist_config(config) {
             Ok(()) => {
-                self.config = config;
                 let label_key = if language == crate::locale::Language::EnUs {
                     "language_en"
                 } else {
@@ -201,7 +201,7 @@ impl KeepWindow {
         if let Some(index) = self
             .releases
             .iter()
-            .position(|release| release.target.same_identity(&target))
+            .position(|release| release.matches(&target))
         {
             self.releases.remove(index);
             self.suppressed.push(target);
@@ -252,7 +252,7 @@ impl KeepWindow {
         if let Some(release) = self
             .releases
             .iter_mut()
-            .find(|release| release.target.same_identity(&target))
+            .find(|release| release.matches(&target))
         {
             release.deadline = Instant::now() + Duration::from_secs(10);
             self.status = crate::locale::text("temporary_release_reset_to_seconds").into();
@@ -261,12 +261,19 @@ impl KeepWindow {
             .iter()
             .position(|p| p.target.same_identity(&target))
         {
-            let result = crate::recovery::Identity::capture(&target).and_then(|identity| {
+            let result = self.protections[index].identity().and_then(|identity| {
                 let options = self.protections[index].options;
+                let marker = crate::recovery::ReleaseMarker::new(identity)?;
+                self.protections[index].identity()?;
                 self.protections[index].restore()?;
+                if !marker.is_current() {
+                    return Err(crate::locale::text(
+                        "target_window_closed_or_was_recreated_select",
+                    ));
+                }
                 Ok(Release {
                     target,
-                    identity,
+                    marker,
                     options,
                     deadline: Instant::now() + Duration::from_secs(10),
                 })
@@ -298,9 +305,7 @@ impl KeepWindow {
         let mut pending = Vec::new();
         let mut changed = false;
         for release in std::mem::take(&mut self.releases) {
-            if !crate::recovery::Identity::capture(&release.target)
-                .is_ok_and(|current| release.identity.matches(&current))
-            {
+            if !release.marker.is_current() {
                 self.events.push(
                     &crate::locale::text("temporary_release"),
                     crate::locale::text("window_closed_or_identity_could_not_be"),
@@ -313,10 +318,11 @@ impl KeepWindow {
                 pending.push(release);
             } else {
                 changed = true;
-                match Protection::start_logged(
+                match Protection::resume(
                     release.target.clone(),
                     release.options,
                     self.recovery.clone(),
+                    &release.marker,
                 ) {
                     Ok(protection) => {
                         self.protections.push(protection);
@@ -364,21 +370,27 @@ impl KeepWindow {
         let Some(target) = self.selected.clone() else {
             return;
         };
-        let options = self
+        let attempt = self
             .attempts
             .iter()
-            .find(|attempt| attempt.target.same_identity(&target))
-            .map(|attempt| attempt.rule.options);
-        self.attempts
-            .retain(|attempt| !attempt.target.same_identity(&target));
+            .position(|attempt| attempt.target.same_identity(&target));
         self.suppressed.retain(|item| !item.same_identity(&target));
-        if let Some(options) = options {
-            match Protection::start_logged(target, options, self.recovery.clone()) {
+        if let Some(index) = attempt {
+            let options = self.attempts[index].rule.options;
+            match Protection::start_logged(target.clone(), options, self.recovery.clone()) {
                 Ok(protection) => {
                     self.protections.push(protection);
+                    self.attempts.remove(index);
                     self.status = crate::locale::text("protection_retry_succeeded").into();
                 }
-                Err(error) => self.status = error.into(),
+                Err(error) => {
+                    self.attempts[index].fail_again(
+                        error.clone(),
+                        Protection::failure_kind(&target, &self.recovery),
+                        Instant::now(),
+                    );
+                    self.status = error.into();
+                }
             }
             self.rebuild_table(cx);
         } else {
@@ -407,9 +419,8 @@ impl KeepWindow {
             Ok(()) => {
                 let mut config = self.config.clone();
                 config.hotkeys = values;
-                match self.store.save(&config) {
+                match self.persist_config(config) {
                     Ok(()) => {
-                        self.config = config;
                         self.status = crate::locale::text("hotkey_settings_saved").into();
                     }
                     Err(error) => {
@@ -514,60 +525,81 @@ impl KeepWindow {
     }
 
     fn diagnostic(&self) -> String {
-        let mut text = crate::locale::format(
-            "keepwindow_windows_protected_awaiting_retry_temporarily_released",
-            &[
-                ("value1", env!("CARGO_PKG_VERSION")),
-                (
-                    "value2",
-                    &std::env::var("OS")
-                        .unwrap_or_else(|_| "Windows".into())
-                        .to_string(),
-                ),
-                ("value3", &format!("{}", self.protections.len())),
-                ("value4", &format!("{}", self.attempts.len())),
-                ("value5", &format!("{}", self.releases.len())),
-            ],
-        );
-        if self.include_private {
-            for event in &self.events.entries {
-                text.push_str(&crate::locale::format(
-                    "times",
-                    &[
-                        ("value1", &format!("{}", event.time)),
-                        ("value2", &event.source.to_string()),
-                        ("value3", &event.detail.to_string()),
-                        ("value4", &format!("{}", event.count)),
-                    ],
-                ));
-            }
-            for target in &self.windows {
-                text.push_str(&format!(
-                    "{} | {}\n",
-                    target.display_title(),
-                    self.path_for(target)
-                        .unwrap_or(&crate::locale::text("unknown_path"))
-                ));
-            }
-        } else {
-            text.push_str(&crate::locale::text(
-                "privacy_mode_window_titles_paths_and_free",
-            ));
-            for attempt in &self.attempts {
-                text.push_str(&if attempt.waiting() {
-                    crate::locale::text("protection_failed_awaiting_retry")
+        self.events.diagnostic(
+            &crate::events::Diagnostic {
+                protection_statuses: self
+                    .protections
+                    .iter()
+                    .map(|p| p.status().label())
+                    .collect(),
+                attempts_waiting: self.attempts.iter().map(Attempt::waiting).collect(),
+                releases: self.releases.len(),
+                windows: if self.include_private {
+                    self.windows
+                        .iter()
+                        .map(|target| {
+                            (
+                                target.display_title(),
+                                self.path_for(target)
+                                    .map(str::to_string)
+                                    .unwrap_or_else(|| crate::locale::text("unknown_path")),
+                            )
+                        })
+                        .collect()
                 } else {
-                    crate::locale::text("protection_failed_manual_action_required")
-                });
-            }
-            for protection in &self.protections {
-                text.push_str(&crate::locale::format(
-                    "status",
-                    &[("value1", &protection.status().label().to_string())],
-                ));
-            }
+                    Vec::new()
+                },
+            },
+            self.include_private,
+        )
+    }
+
+    fn export_diagnostic(&mut self, cx: &mut Context<Self>) {
+        if self.exporting_diagnostic {
+            return;
         }
-        text
+        let diagnostic = self.diagnostic();
+        let selection =
+            cx.prompt_for_new_path(std::path::Path::new(""), Some("KeepWindow-diagnostics.txt"));
+        self.exporting_diagnostic = true;
+        cx.spawn(async move |this, cx| {
+            let result = async {
+                let path = selection
+                    .await
+                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                match path {
+                    Some(path) => {
+                        cx.background_executor()
+                            .spawn(async move {
+                                crate::events::export(&path, &diagnostic).map(|()| Some(()))
+                            })
+                            .await
+                    }
+                    None => Ok(None),
+                }
+            }
+            .await;
+            let _ = this.update(cx, |this, cx| {
+                this.exporting_diagnostic = false;
+                match result {
+                    Ok(Some(())) => {
+                        this.status = crate::locale::text("diagnostics_exported").into()
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        this.status = crate::locale::format(
+                            "diagnostic_export_failed_error",
+                            &[("error", &error)],
+                        )
+                        .into()
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     fn new(
@@ -779,6 +811,7 @@ impl KeepWindow {
             events: Events::default(),
             events_open: false,
             include_private: false,
+            exporting_diagnostic: false,
             rule_name,
             transfer_path,
             imported: None,
@@ -1113,16 +1146,13 @@ impl KeepWindow {
             .windows
             .iter()
             .filter(|item| {
-                let special = self.protection_for(item).is_some()
+                let managed = self.protection_for(item).is_some()
                     || self
                         .attempts
                         .iter()
                         .any(|attempt| attempt.target.same_identity(item))
-                    || self
-                        .releases
-                        .iter()
-                        .any(|release| release.target.same_identity(item))
-                    || self.pinned.iter().any(|target| target.same_identity(item));
+                    || self.releases.iter().any(|release| release.matches(item));
+                let pinned = self.pinned.iter().any(|target| target.same_identity(item));
                 let search = format!(
                     "{} {} {} {} 0x{:x} {}",
                     item.title,
@@ -1134,13 +1164,7 @@ impl KeepWindow {
                 )
                 .to_lowercase();
                 query.split_whitespace().all(|term| search.contains(term))
-                    && (!self.config.list.protected_only
-                        || self.protection_for(item).is_some()
-                        || self
-                            .releases
-                            .iter()
-                            .any(|release| release.target.same_identity(item)))
-                    && (self.config.list.show_auxiliary || special || !item.auxiliary())
+                    && self.config.list.includes(managed, pinned, item.auxiliary())
             })
             .map(|item| WindowRow {
                 application: self
@@ -1158,7 +1182,7 @@ impl KeepWindow {
                     .or_else(|| {
                         self.releases
                             .iter()
-                            .find(|release| release.target.same_identity(item))
+                            .find(|release| release.matches(item))
                             .map(|_| {
                                 (
                                     crate::locale::text("temporary_release"),
@@ -1406,10 +1430,7 @@ impl KeepWindow {
         }
         for target in self.windows.clone() {
             if self.protection_for(&target).is_some()
-                || self
-                    .releases
-                    .iter()
-                    .any(|release| release.target.same_identity(&target))
+                || self.releases.iter().any(|release| release.matches(&target))
                 || self
                     .suppressed
                     .iter()
@@ -1535,15 +1556,27 @@ impl KeepWindow {
         cx.notify();
     }
 
-    fn commit_config(&mut self, config: Config) {
-        match self.store.save(&config) {
+    fn persist_config(&mut self, config: Config) -> Result<(), String> {
+        self.store
+            .commit(&mut self.config, config, &mut self.undo_rules)
+    }
+
+    fn commit_config(&mut self, config: Config) -> bool {
+        match self.persist_config(config) {
             Ok(()) => {
-                self.attempts
-                    .retain(|attempt| config.rules.iter().any(|current| current == &attempt.rule));
-                self.config = config;
+                self.attempts.retain(|attempt| {
+                    self.config
+                        .rules
+                        .iter()
+                        .any(|current| current == &attempt.rule)
+                });
                 self.status = crate::locale::text("application_rule_saved").into();
+                true
             }
-            Err(error) => self.status = error.into(),
+            Err(error) => {
+                self.status = error.into();
+                false
+            }
         }
     }
 
@@ -1695,7 +1728,7 @@ impl KeepWindow {
         let result = crate::startup::set_enabled(enabled).and_then(|previous| {
             let mut config = self.config.clone();
             config.startup_enabled = enabled;
-            if let Err(error) = self.store.save(&config) {
+            if let Err(error) = self.persist_config(config) {
                 return Err(match crate::startup::restore(previous.as_deref()) {
                     Ok(()) => error,
                     Err(rollback) => crate::locale::format(
@@ -1707,7 +1740,6 @@ impl KeepWindow {
                     ),
                 });
             }
-            self.config = config;
             self.startup_enabled = enabled;
             Ok(())
         });
@@ -1790,8 +1822,8 @@ impl KeepWindow {
         {
             let mut config = self.config.clone();
             config.rules[index].options = options;
-            match self.store.save(&config) {
-                Ok(()) => self.config = config,
+            match self.persist_config(config) {
+                Ok(()) => {}
                 Err(e) => error = Some(e),
             }
         }
@@ -2604,8 +2636,7 @@ impl Render for KeepWindow {
                                 let mut config = this.config.clone();
                                 config.rules.remove(index);
                                 let undo = this.config.rules.clone();
-                                this.commit_config(config);
-                                if this.config.rules.len() < undo.len() {
+                                if this.commit_config(config) {
                                     this.undo_rules = Some(undo);
                                 }
                                 this.editing_rule = None;
@@ -2725,27 +2756,12 @@ impl Render for KeepWindow {
                                                 })),
                                         )
                                         .child(
-                                            Button::new("open-logs")
+                                            Button::new("export-diagnostic")
                                                 .small()
-                                                .label(crate::locale::text("open_log_folder"))
-                                                .on_click(cx.listener(|this, _, _, _| {
-                                                    if let Some(path) = crate::events::directory() {
-                                                        match std::fs::create_dir_all(&path)
-                                                            .and_then(|()| {
-                                                                std::process::Command::new(
-                                                                    "explorer.exe",
-                                                                )
-                                                                .arg(path)
-                                                                .spawn()
-                                                                .map(|_| ())
-                                                            }) {
-                                                            Ok(()) => {}
-                                                            Err(error) => {
-                                                                this.status =
-                                                                    error.to_string().into()
-                                                            }
-                                                        }
-                                                    }
+                                                .label(crate::locale::text("export_diagnostics"))
+                                                .disabled(self.exporting_diagnostic)
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.export_diagnostic(cx);
                                                 })),
                                         ),
                                 )
@@ -2760,13 +2776,7 @@ impl Render for KeepWindow {
                                                 event.time, event.source, event.detail, event.count
                                             ))
                                         })),
-                                )
-                                .when_some(self.events.error.clone(), |panel, error| {
-                                    panel.child(div().text_xs().child(crate::locale::format(
-                                        "log_write_failed_error",
-                                        &[("error", &error.to_string())],
-                                    )))
-                                }),
+                                ),
                         )
                     })
                     .when(self.rules_open, |container| {
@@ -2845,7 +2855,7 @@ impl Render for KeepWindow {
                                             .small()
                                             .label(crate::locale::text("undo_deletion"))
                                             .on_click(cx.listener(|this, _, _, cx| {
-                                                if let Some(rules) = this.undo_rules.take() {
+                                                if let Some(rules) = this.undo_rules.clone() {
                                                     let mut config = this.config.clone();
                                                     config.rules = rules;
                                                     this.commit_config(config);

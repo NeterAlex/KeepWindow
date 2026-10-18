@@ -4,7 +4,7 @@ English documentation: [README.en.md](README.en.md).
 
 支持简体中文和 English，在 **更多 → 语言** 点击切换，即时生效并保存到配置。未设置时使用 Windows UI 语言；其他语言回退为简体中文。配置版本继续使用 2，旧配置无需修改。
 
-翻译资源位于 `locales/zh-CN.json` 和 `locales/en-US.json`，构建时验证键和命名占位符一致。程序内置两种语言，可单独运行；可执行文件旁同名资源存在时优先加载，损坏或不完整时使用内置中文。日志保留事件产生时的语言。
+翻译资源位于 `locales/zh-CN.json` 和 `locales/en-US.json`，构建时验证键和命名占位符一致。程序内置两种语言，可单独运行；可执行文件旁同名资源存在时优先加载，损坏或不完整时使用内置中文。最近事件保留产生时的语言。
 
 [![CI](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/NeterAlex/KeepWindow?display_name=tag&sort=semver)](https://github.com/NeterAlex/KeepWindow/releases)
@@ -67,6 +67,8 @@ KeepWindow 是一个 Windows 窗口防误关闭工具。它通过系统菜单保
 系统关闭项修改前会写入恢复记录。KeepWindow 正常退出时清理记录；异常退出后再次启动，会校验窗口句柄、进程身份、完整路径和窗口属性，只恢复能够安全匹配的窗口。
 
 无法安全匹配的记录会保留为残留文件，损坏的恢复记录会先备份。恢复失败项会保留，供下一次启动重试。鼠标遮罩随 KeepWindow 进程退出而消失，不参与恢复。
+
+最近事件仅保存在内存中，最多保留 200 条。打开“最近事件与诊断”后，可复制诊断信息，或点击“导出诊断”在 Windows 保存对话框中选择文本文件。默认省略窗口标题、路径与完整错误；勾选“诊断包含标题、路径与完整错误”后，复制和导出均包含这些内容。
 
 后台启动错误记录在：
 

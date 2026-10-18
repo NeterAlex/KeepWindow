@@ -23,7 +23,7 @@ use windows::{
 
 use crate::{
     mouse::MouseRegistration,
-    recovery::{Identity, Recovery},
+    recovery::{Identity, Recovery, ReleaseMarker},
     runtime::FailureKind,
     window::{WindowInfo, is_cloaked, valid_rect, wide},
 };
@@ -205,8 +205,26 @@ impl Protection {
         options: Options,
         recovery: Recovery,
     ) -> Result<Self, String> {
+        Self::start_checked(target, options, recovery, None)
+    }
+
+    pub fn resume(
+        target: WindowInfo,
+        options: Options,
+        recovery: Recovery,
+        marker: &ReleaseMarker,
+    ) -> Result<Self, String> {
+        Self::start_checked(target, options, recovery, Some(marker))
+    }
+
+    fn start_checked(
+        target: WindowInfo,
+        options: Options,
+        recovery: Recovery,
+        release: Option<&ReleaseMarker>,
+    ) -> Result<Self, String> {
         options.validate()?;
-        if !target.is_same_window() {
+        if !target.is_same_window() || release.is_some_and(|marker| !marker.matches(&target)) {
             return Err(crate::locale::text(
                 "target_window_closed_refresh_the_window_list",
             ));
@@ -247,6 +265,11 @@ impl Protection {
                 )
             })?;
         }
+        if release.is_some_and(|marker| !marker.matches(&protection.target)) {
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_select",
+            ));
+        }
         if options.system_menu {
             let menu = unsafe { GetSystemMenu(protection.target.hwnd, false) };
             let has_close = !menu.0.is_null()
@@ -280,6 +303,21 @@ impl Protection {
     pub fn alive(&self) -> bool {
         self.target.is_same_window()
             && unsafe { GetPropW(self.target.hwnd, PCWSTR(self.marker.as_ptr())).0 as usize == 1 }
+    }
+
+    pub fn identity(&self) -> Result<Identity, String> {
+        let identity = Identity::capture(&self.target)?;
+        if !self.alive()
+            || self
+                .pending
+                .as_ref()
+                .is_some_and(|pending| !pending.matches(&identity))
+        {
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_select",
+            ));
+        }
+        Ok(identity)
     }
 
     pub fn status(&self) -> ProtectionStatus {
@@ -358,6 +396,7 @@ impl Protection {
             if !options.system_menu
                 && let Some(menu) = &self.menu
             {
+                self.identity()?;
                 set_close_state(self.target.hwnd, menu.menu, menu.original_disabled)?;
                 self.menu = None;
                 self.clear_record()?;
@@ -501,6 +540,13 @@ impl Protection {
             self.recovery_failed = false;
             return Ok(());
         }
+        if self.pending.is_some()
+            && let Err(error) = self.identity()
+        {
+            self.recovery_failed = true;
+            self.error = Some(error.clone());
+            return Err(error);
+        }
         if let Some(menu) = &self.menu {
             unsafe {
                 if GetSystemMenu(self.target.hwnd, false) == menu.menu
@@ -555,7 +601,11 @@ impl Protection {
             original_disabled: MENU_ITEM_FLAGS(original_disabled),
         });
         if let Err(error) = set_close_state(self.target.hwnd, menu, MF_GRAYED) {
-            if set_close_state(self.target.hwnd, menu, MENU_ITEM_FLAGS(original_disabled)).is_ok() {
+            if self.identity().is_ok()
+                && unsafe { GetSystemMenu(self.target.hwnd, false) == menu }
+                && set_close_state(self.target.hwnd, menu, MENU_ITEM_FLAGS(original_disabled))
+                    .is_ok()
+            {
                 self.menu = None;
                 self.clear_record()?;
             } else {
@@ -767,6 +817,66 @@ mod tests {
     };
 
     struct TestProcess(Child);
+
+    #[test]
+    fn restore_and_menu_updates_reject_changed_process_identity() {
+        unsafe {
+            let hwnd = CreateWindowExW(
+                WINDOW_EX_STYLE(0),
+                w!("STATIC"),
+                w!("Recovery identity test"),
+                WS_OVERLAPPEDWINDOW,
+                0,
+                0,
+                300,
+                200,
+                None,
+                None,
+                Some(GetModuleHandleW(None).unwrap().into()),
+                None,
+            )
+            .unwrap();
+            let mut protection = Protection::start(
+                WindowInfo::inspect(hwnd).unwrap(),
+                Options {
+                    mouse_shield: false,
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+            let original = protection.pending.clone().unwrap();
+            for field in 0..2 {
+                let pending = protection.pending.as_mut().unwrap();
+                if field == 0 {
+                    pending.creation += 1;
+                } else {
+                    pending.path.push('x');
+                }
+                assert!(protection.identity().is_err());
+                assert!(
+                    protection
+                        .update_options(Options {
+                            system_menu: false,
+                            ..Default::default()
+                        })
+                        .is_err()
+                );
+                assert!(
+                    protection
+                        .restore_with(|_, _, _| panic!("must not mutate mismatched window"))
+                        .is_err()
+                );
+                assert!(protection.recovery_failed);
+                assert_ne!(original_close_state(hwnd).unwrap(), 0);
+                assert!(protection.pending.is_some());
+                protection.pending = Some(original.clone());
+                protection.recovery_failed = false;
+            }
+            protection.restore().unwrap();
+            assert_eq!(original_close_state(hwnd).unwrap(), 0);
+            DestroyWindow(hwnd).unwrap();
+        }
+    }
 
     #[test]
     fn live_updates_switch_components_and_preserve_original_menu_state() {

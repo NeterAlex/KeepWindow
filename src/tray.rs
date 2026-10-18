@@ -260,16 +260,31 @@ impl Tray {
         let mut data = self.state.data.get();
         data.uFlags = NIF_INFO;
         data.dwInfoFlags = NIIF_WARNING;
-        let title = crate::window::wide(&format!(
-            "KeepWindow {}",
-            crate::locale::text("protection_notice")
-        ));
-        data.szInfoTitle[..title.len()].copy_from_slice(&title);
-        let text: Vec<u16> = text.encode_utf16().take(data.szInfo.len() - 1).collect();
-        data.szInfo[..text.len()].copy_from_slice(&text);
+        let title = format!("KeepWindow {}", crate::locale::text("protection_notice"));
+        notification_text(&mut data, &title, text);
         unsafe {
             let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
         }
+    }
+}
+
+fn notification_text(data: &mut NOTIFYICONDATAW, title: &str, text: &str) {
+    for (buffer, value) in [
+        (&mut data.szInfoTitle[..], title),
+        (&mut data.szInfo[..], text),
+    ] {
+        buffer.fill(0);
+        let mut length = 0;
+        for character in value.chars().take_while(|&character| character != '\0') {
+            let mut units = [0u16; 2];
+            let encoded = character.encode_utf16(&mut units);
+            if length + encoded.len() >= buffer.len() {
+                break;
+            }
+            buffer[length..length + encoded.len()].copy_from_slice(encoded);
+            length += encoded.len();
+        }
+        buffer[length] = 0;
     }
 }
 
@@ -370,6 +385,35 @@ mod tests {
         protection::{Options, Protection},
         window::WindowInfo,
     };
+
+    #[test]
+    fn notification_buffers_are_cleared_terminated_and_never_split_surrogates() {
+        let mut data = NOTIFYICONDATAW::default();
+        notification_text(
+            &mut data,
+            &"long title".repeat(20),
+            &"long message".repeat(40),
+        );
+        notification_text(&mut data, "short", "new");
+        assert_eq!(
+            &data.szInfoTitle[..5],
+            &"short".encode_utf16().collect::<Vec<_>>()
+        );
+        assert!(data.szInfoTitle[5..].iter().all(|&unit| unit == 0));
+        assert_eq!(&data.szInfo[..3], &"new".encode_utf16().collect::<Vec<_>>());
+        assert!(data.szInfo[3..].iter().all(|&unit| unit == 0));
+
+        let long = format!("{}\u{1f600}tail", "a".repeat(data.szInfoTitle.len() - 2));
+        notification_text(&mut data, &long, &"\u{1f600}".repeat(200));
+        for buffer in [&data.szInfoTitle[..], &data.szInfo[..]] {
+            assert_eq!(buffer.last(), Some(&0));
+            let length = buffer.iter().position(|&unit| unit == 0).unwrap();
+            assert!(String::from_utf16(&buffer[..length]).is_ok());
+        }
+        notification_text(&mut data, "a\0old", "");
+        assert!(data.szInfoTitle[1..].iter().all(|&unit| unit == 0));
+        assert!(data.szInfo.iter().all(|&unit| unit == 0));
+    }
 
     #[test]
     fn close_and_minimize_keep_window_and_protection_alive_and_drop_unhooks() {

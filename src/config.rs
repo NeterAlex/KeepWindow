@@ -55,6 +55,13 @@ pub struct ListPreferences {
     pub advanced_columns: bool,
 }
 
+impl ListPreferences {
+    pub fn includes(&self, managed: bool, pinned: bool, auxiliary: bool) -> bool {
+        (!self.protected_only || managed)
+            && (self.show_auxiliary || managed || pinned || !auxiliary)
+    }
+}
+
 impl Default for Config {
     fn default() -> Self {
         Self {
@@ -205,6 +212,18 @@ impl Store {
         let bytes = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
         atomic_write(path, &bytes)
     }
+
+    pub fn commit(
+        &self,
+        current: &mut Config,
+        next: Config,
+        undo_rules: &mut Option<Vec<Rule>>,
+    ) -> Result<(), String> {
+        self.save(&next)?;
+        *current = next;
+        *undo_rules = None;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -246,6 +265,72 @@ mod tests {
             automatic: false,
             options: Options::default(),
         }
+    }
+
+    #[test]
+    fn only_latest_delete_can_be_undone_and_failed_saves_preserve_it() {
+        let directory =
+            std::env::temp_dir().join(format!("keep-window-undo-test-{}", std::process::id()));
+        let path = directory.join("config.json");
+        let (store, mut current, _) = Store::load_path(Some(path.clone()));
+        current.rules = vec![rule("first"), rule("second")];
+        let deleted = current.rules.clone();
+        let mut next = current.clone();
+        next.rules.remove(0);
+        let mut undo = None;
+        store.commit(&mut current, next, &mut undo).unwrap();
+        undo = Some(deleted.clone());
+
+        let mut invalid = current.clone();
+        invalid.version = 99;
+        assert!(store.commit(&mut current, invalid, &mut undo).is_err());
+        assert_eq!(undo, Some(deleted.clone()));
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        let mut changed = current.clone();
+        changed.rules[0].name = "must not be committed".into();
+        let previous = current.rules.clone();
+        assert!(store.commit(&mut current, changed, &mut undo).is_err());
+        assert_eq!(current.rules, previous);
+        assert_eq!(undo, Some(deleted.clone()));
+        fs::remove_dir(&path).unwrap();
+        let mut restored = current.clone();
+        restored.rules = undo.clone().unwrap();
+        store.commit(&mut current, restored, &mut undo).unwrap();
+        assert_eq!(current.rules, deleted);
+        assert!(undo.is_none());
+
+        for mutation in 0..5 {
+            undo = Some(deleted.clone());
+            let mut edited = current.clone();
+            match mutation {
+                0 => edited.rules[0].name = "edited".into(),
+                1 => edited.rules.swap(0, 1),
+                2 => edited.rules[0].automatic = true,
+                3 => edited.upsert(rule("imported"), None),
+                _ => edited.list.protected_only = true,
+            }
+            store.commit(&mut current, edited, &mut undo).unwrap();
+            assert!(undo.is_none());
+        }
+        fs::remove_file(path).unwrap();
+        fs::remove_dir(directory).unwrap();
+    }
+
+    #[test]
+    fn protected_filter_keeps_failed_waiting_and_temporarily_released_windows() {
+        let preferences = ListPreferences {
+            protected_only: true,
+            ..Default::default()
+        };
+        for auxiliary in [false, true] {
+            assert!(preferences.includes(true, false, auxiliary));
+            assert!(!preferences.includes(false, false, auxiliary));
+            assert!(!preferences.includes(false, true, auxiliary));
+        }
+        let preferences = ListPreferences::default();
+        assert!(!preferences.includes(false, false, true));
+        assert!(preferences.includes(false, true, true));
     }
 
     #[test]

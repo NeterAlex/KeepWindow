@@ -9,7 +9,10 @@ use std::{
 use serde::{Deserialize, Serialize};
 use windows::Win32::Foundation::HWND;
 use windows::{
-    Win32::UI::WindowsAndMessaging::{GetPropW, RemovePropW},
+    Win32::{
+        Foundation::HANDLE,
+        UI::WindowsAndMessaging::{GetPropW, RemovePropW, SetPropW},
+    },
     core::PCWSTR,
 };
 
@@ -68,6 +71,86 @@ impl Identity {
             .filter(|current| self.matches(current))
             .map(|_| target)
     }
+
+    pub fn is_current(&self) -> bool {
+        self.current().is_some()
+    }
+}
+
+// Retain proof of the original HWND while its protection is temporarily removed.
+pub struct ReleaseMarker {
+    identity: Identity,
+    name: Vec<u16>,
+}
+
+impl ReleaseMarker {
+    pub fn new(identity: Identity) -> Result<Self, String> {
+        if !identity.is_current() {
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_select",
+            ));
+        }
+        let marker = Self {
+            identity,
+            name: window::wide(&format!(
+                "KeepWindow.Release.{}.{}",
+                std::process::id(),
+                nonce()
+            )),
+        };
+        unsafe {
+            SetPropW(
+                HWND(marker.identity.hwnd as usize as *mut _),
+                PCWSTR(marker.name.as_ptr()),
+                Some(HANDLE(std::ptr::dangling_mut())),
+            )
+        }
+        .map_err(|error| {
+            crate::locale::format(
+                "cannot_access_target_window_error_if_the",
+                &[("error", &error.to_string())],
+            )
+        })?;
+        if !marker.is_current() {
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_select",
+            ));
+        }
+        Ok(marker)
+    }
+
+    pub fn is_current(&self) -> bool {
+        self.identity.is_current()
+            && unsafe {
+                GetPropW(
+                    HWND(self.identity.hwnd as usize as *mut _),
+                    PCWSTR(self.name.as_ptr()),
+                )
+                .0 as usize
+                    == 1
+            }
+    }
+
+    pub fn matches(&self, target: &WindowInfo) -> bool {
+        self.identity.hwnd == target.hwnd.0 as usize as u64
+            && self.identity.pid == target.pid
+            && self.identity.thread_id == target.thread_id
+            && self.identity.class == target.class
+            && self.is_current()
+    }
+}
+
+impl Drop for ReleaseMarker {
+    fn drop(&mut self) {
+        if self.is_current() {
+            unsafe {
+                let _ = RemovePropW(
+                    HWND(self.identity.hwnd as usize as *mut _),
+                    PCWSTR(self.name.as_ptr()),
+                );
+            }
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -75,6 +158,20 @@ pub struct Record {
     pub identity: Identity,
     pub original_disabled: u32,
     pub marker: Vec<u16>,
+}
+
+impl Record {
+    fn is_current(&self) -> bool {
+        self.identity.is_current()
+            && unsafe {
+                GetPropW(
+                    HWND(self.identity.hwnd as usize as *mut _),
+                    PCWSTR(self.marker.as_ptr()),
+                )
+                .0 as usize
+                    == 1
+            }
+    }
 }
 
 #[derive(Default, Serialize, Deserialize)]
@@ -181,10 +278,8 @@ impl Recovery {
                     continue;
                 }
                 let hwnd = HWND(record.identity.hwnd as usize as *mut _);
-                // Window properties outlive a crashed owner, but disappear when the target is destroyed.
-                let marked =
-                    unsafe { GetPropW(hwnd, PCWSTR(record.marker.as_ptr())).0 as usize == 1 };
-                if duplicate || record.identity.current().is_none() || !marked {
+                // Check the property last: it disappears even when an HWND is reused in the same process.
+                if duplicate || !record.is_current() {
                     let skipped: Vec<_> = journal
                         .records
                         .iter()
@@ -478,6 +573,85 @@ mod tests {
         let mut upper = identity.clone();
         upper.path = upper.path.to_uppercase();
         assert!(identity.matches(&upper));
+    }
+
+    #[test]
+    fn release_marker_requires_identity_and_window_property_and_cleans_up() {
+        let target = Target::new();
+        let identity = Identity::capture(&target.info()).unwrap();
+        let mut marker = ReleaseMarker::new(identity.clone()).unwrap();
+        assert!(marker.matches(&target.info()));
+        for field in 0..2 {
+            if field == 0 {
+                marker.identity.creation += 1;
+            } else {
+                marker.identity.path.push('x');
+            }
+            assert!(!marker.is_current());
+            marker.identity = identity.clone();
+        }
+        let name = marker.name.clone();
+        drop(marker);
+        assert!(unsafe { GetPropW(target.0, PCWSTR(name.as_ptr())).is_invalid() });
+
+        let marker = ReleaseMarker::new(identity.clone()).unwrap();
+        unsafe {
+            RemovePropW(target.0, PCWSTR(marker.name.as_ptr())).unwrap();
+        }
+        // All ordinary identity fields still match, but restoration must not resume.
+        assert!(identity.is_current());
+        assert!(!marker.is_current());
+        assert!(
+            crate::protection::Protection::resume(
+                target.info(),
+                crate::protection::Options {
+                    mouse_shield: false,
+                    ..Default::default()
+                },
+                Recovery::testing(),
+                &marker,
+            )
+            .is_err()
+        );
+        assert_eq!(target.state(), 0);
+
+        let marker = ReleaseMarker::new(identity).unwrap();
+        drop(target);
+        assert!(!marker.is_current());
+    }
+
+    #[test]
+    fn temporary_release_resumes_matching_window_and_removes_only_its_marker() {
+        let target = Target::new();
+        let recovery = Recovery::testing();
+        let options = crate::protection::Options {
+            mouse_shield: false,
+            ..Default::default()
+        };
+        let mut protection =
+            crate::protection::Protection::start_logged(target.info(), options, recovery.clone())
+                .unwrap();
+        let marker = ReleaseMarker::new(protection.identity().unwrap()).unwrap();
+        protection.restore().unwrap();
+        drop(protection);
+        assert_eq!(target.state(), 0);
+        assert!(marker.is_current());
+        let mut resumed = crate::protection::Protection::resume(
+            target.info(),
+            options,
+            recovery.clone(),
+            &marker,
+        )
+        .unwrap();
+        assert_ne!(target.state(), 0);
+        assert_eq!(read_log(&recovery).records.len(), 1);
+        let name = marker.name.clone();
+        drop(marker);
+        assert!(unsafe { GetPropW(target.0, PCWSTR(name.as_ptr())).is_invalid() });
+        assert!(resumed.alive());
+        resumed.restore().unwrap();
+        assert_eq!(target.state(), 0);
+        assert!(read_log(&recovery).records.is_empty());
     }
 
     #[test]
