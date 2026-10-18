@@ -42,9 +42,12 @@ fn open(subkey: PCWSTR, write: bool) -> Result<Option<Key>, String> {
     if status == ERROR_FILE_NOT_FOUND && !write {
         return Ok(None);
     }
-    status
-        .ok()
-        .map_err(|e| format!("无法访问当前用户开机启动项：{e}"))?;
+    status.ok().map_err(|e| {
+        crate::locale::format(
+            "cannot_access_current_user_startup_entry_e",
+            &[("e", &format!("{}", e))],
+        )
+    })?;
     Ok(Some(Key(key)))
 }
 
@@ -59,11 +62,13 @@ fn read(subkey: PCWSTR) -> Result<Option<Vec<u16>>, String> {
     if status == ERROR_FILE_NOT_FOUND {
         return Ok(None);
     }
-    status
-        .ok()
-        .map_err(|e| format!("读取开机启动项失败：{e}"))?;
+    status.ok().map_err(|e| {
+        crate::locale::format("cannot_read_startup_entry_e", &[("e", &format!("{}", e))])
+    })?;
     if kind != REG_SZ || length > 131072 || length % 2 != 0 {
-        return Err("KeepWindow 开机启动项格式不正确。".into());
+        return Err(crate::locale::text(
+            "keepwindow_startup_entry_has_an_invalid_format",
+        ));
     }
     let mut buffer = vec![0u16; length as usize / 2];
     unsafe {
@@ -77,7 +82,9 @@ fn read(subkey: PCWSTR) -> Result<Option<Vec<u16>>, String> {
         )
     }
     .ok()
-    .map_err(|e| format!("读取开机启动项失败：{e}"))?;
+    .map_err(|e| {
+        crate::locale::format("cannot_read_startup_entry_e", &[("e", &format!("{}", e))])
+    })?;
     buffer.truncate(length as usize / 2);
     while buffer.last() == Some(&0) {
         buffer.pop();
@@ -89,7 +96,7 @@ fn write(subkey: PCWSTR, command: Option<&[u16]>) -> Result<(), String> {
     if command.is_none() && read(subkey)?.is_none() {
         return Ok(());
     }
-    let key = open(subkey, true)?.ok_or("开机启动项不可用。")?;
+    let key = open(subkey, true)?.ok_or(crate::locale::text("startup_entry_unavailable"))?;
     let status = unsafe {
         if let Some(command) = command {
             let terminated: Vec<_> = command.iter().copied().chain(Some(0)).collect();
@@ -106,21 +113,28 @@ fn write(subkey: PCWSTR, command: Option<&[u16]>) -> Result<(), String> {
         return Ok(());
     }
     if status != ERROR_SUCCESS {
-        return Err(format!("更新当前用户开机启动项失败：{}", status.0));
+        return Err(crate::locale::format(
+            "cannot_update_current_user_startup_entry",
+            &[("value1", &format!("{}", status.0))],
+        ));
     }
     Ok(())
 }
 
 fn command(path: &Path) -> Result<Vec<u16>, String> {
     if !path.is_absolute() || !path.is_file() {
-        return Err("当前可执行文件路径不可用，无法开启开机启动。".into());
+        return Err(crate::locale::text(
+            "executable_path_unavailable_cannot_enable_startup",
+        ));
     }
     let path: Vec<_> = path.as_os_str().encode_wide().collect();
     if path
         .iter()
         .any(|value| *value == 0 || *value == u16::from(b'"'))
     {
-        return Err("可执行文件路径包含无效字符。".into());
+        return Err(crate::locale::text(
+            "executable_path_contains_invalid_characters",
+        ));
     }
     let mut result = vec![u16::from(b'"')];
     result.extend(path);
@@ -129,14 +143,18 @@ fn command(path: &Path) -> Result<Vec<u16>, String> {
 }
 
 pub fn enabled() -> Result<bool, String> {
-    let executable = std::env::current_exe().map_err(|e| format!("无法获取可执行文件路径：{e}"))?;
+    let executable = std::env::current_exe().map_err(|e| {
+        crate::locale::format("cannot_get_executable_path_e", &[("e", &format!("{}", e))])
+    })?;
     Ok(read(RUN_KEY)?
         .is_some_and(|value| command(&executable).is_ok_and(|expected| value == expected)))
 }
 
 // Return the previous value so a failed config save can restore the exact registry state.
 pub fn set_enabled(enabled: bool) -> Result<Option<Vec<u16>>, String> {
-    let executable = std::env::current_exe().map_err(|e| format!("无法获取可执行文件路径：{e}"))?;
+    let executable = std::env::current_exe().map_err(|e| {
+        crate::locale::format("cannot_get_executable_path_e", &[("e", &format!("{}", e))])
+    })?;
     let command = command(&executable)?;
     let previous = read(RUN_KEY)?;
     write(RUN_KEY, enabled.then_some(command.as_slice()))?;

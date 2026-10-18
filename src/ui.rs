@@ -86,20 +86,30 @@ impl WindowTable {
             selected_row: None,
             layout_width: px(0.),
             columns: vec![
-                Column::new("application", "应用")
+                Column::new("application", crate::locale::text("application"))
                     .width(150.)
                     .min_width(90.),
-                Column::new("title", "窗口名称").width(430.).min_width(200.),
+                Column::new("title", crate::locale::text("window_name"))
+                    .width(430.)
+                    .min_width(200.),
                 Column::new("pid", "PID").width(86.).min_width(70.),
-                Column::new("handle", "窗口句柄")
+                Column::new("handle", crate::locale::text("window_handle"))
                     .width(138.)
                     .min_width(112.),
-                Column::new("status", "保护状态")
+                Column::new("status", crate::locale::text("protection_status"))
                     .width(122.)
                     .resizable(false),
             ],
             icons: HashMap::new(),
         }
+    }
+
+    pub fn localize_columns(&mut self) {
+        let fresh = Self::new();
+        self.columns = fresh.columns;
+        let width = self.layout_width;
+        self.layout_width = px(0.);
+        self.fit_width(width);
     }
 
     pub fn sync_icons(
@@ -257,7 +267,7 @@ impl TableDelegate for WindowTable {
                     .protection
                     .as_ref()
                     .map(|(_, detail)| detail.clone())
-                    .unwrap_or_else(|| "尚未开启保护".into());
+                    .unwrap_or_else(|| crate::locale::text("protection_has_not_been_enabled"));
                 let status = if let Some((label, _)) = &row.protection {
                     Tag::custom(theme.primary, theme.primary_foreground, theme.primary)
                         .small()
@@ -268,7 +278,7 @@ impl TableDelegate for WindowTable {
                     div()
                         .text_xs()
                         .text_color(theme.muted_foreground)
-                        .child("未保护")
+                        .child(crate::locale::text("unprotected_2"))
                         .into_any_element()
                 };
                 cell.child(
@@ -295,14 +305,14 @@ impl TableDelegate for WindowTable {
             .text_color(cx.theme().muted_foreground)
             .child(Icon::new(IconName::Search).size(px(24.)))
             .child(if self.filtered {
-                "没有匹配的窗口"
+                crate::locale::text("no_matching_windows")
             } else {
-                "暂无可保护的窗口"
+                crate::locale::text("no_protectable_windows")
             })
             .child(div().text_sm().child(if self.filtered {
-                "试试其他关键词，或清除搜索条件。"
+                crate::locale::text("try_other_keywords_or_clear_the_search")
             } else {
-                "打开目标程序后，点击右上角刷新。"
+                crate::locale::text("open_the_target_application_then_click_refresh")
             }))
     }
 }

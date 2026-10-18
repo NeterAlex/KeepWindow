@@ -109,7 +109,7 @@ impl MousePicker {
         {
             let mut registry = service.registry.lock().unwrap_or_else(|e| e.into_inner());
             if registry.picker.is_some() {
-                return Err("窗口选择已在进行中。".into());
+                return Err(crate::locale::text("window_selection_is_already_active"));
             }
             registry.picker = Some(PickerState {
                 events: sender,
@@ -135,10 +135,13 @@ impl MousePicker {
                 PickerEvent::Cancel => return Ok(Some(None)),
                 PickerEvent::Error(error) => return Err(error),
                 PickerEvent::Selected(identity) => {
-                    let target = picker_target(HWND(identity.hwnd as usize as *mut _))
-                        .ok_or("目标窗口已关闭或不可选择。")?;
+                    let target = picker_target(HWND(identity.hwnd as usize as *mut _)).ok_or(
+                        crate::locale::text("target_window_closed_or_cannot_be_selected"),
+                    )?;
                     if !Identity::capture(&target)?.matches(&identity) {
-                        return Err("目标窗口身份已变化，请重新选择。".into());
+                        return Err(crate::locale::text(
+                            "target_window_identity_changed_select_it_again",
+                        ));
                     }
                     return Ok(Some(Some(target)));
                 }
@@ -324,7 +327,9 @@ impl Service {
                 Ok(hook) => {
                     let timer = SetTimer(None, 0, 16, None);
                     if timer == 0 {
-                        let _ = ready.send(Err("无法创建窗口选择定时器。".into()));
+                        let _ = ready.send(Err(crate::locale::text(
+                            "cannot_create_window_selection_timer",
+                        )));
                         let _ = UnhookWindowsHookEx(hook);
                         HOOK_STATE.with(|slot| *slot.borrow_mut() = None);
                         return;
@@ -368,7 +373,10 @@ impl Service {
                     let _ = UnhookWindowsHookEx(hook);
                 }
                 Err(error) => {
-                    let _ = ready.send(Err(format!("无法安装鼠标保护：{error}")));
+                    let _ = ready.send(Err(crate::locale::format(
+                        "cannot_install_mouse_protection_error",
+                        &[("error", &format!("{}", error))],
+                    )));
                 }
             }
             HOOK_STATE.with(|slot| *slot.borrow_mut() = None);

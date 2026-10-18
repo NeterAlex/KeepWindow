@@ -97,23 +97,27 @@ impl Config {
 
     pub fn validate(&self) -> Result<(), String> {
         if self.version != 2 {
-            return Err(format!(
-                "不支持的配置版本：{}。原文件未修改。",
-                self.version
+            return Err(crate::locale::format(
+                "unsupported_configuration_version_original_file_unchanged",
+                &[("value1", &format!("{}", self.version))],
             ));
         }
         if let Some(language) = &self.language
             && !matches!(language.as_str(), "zh-CN" | "en-US")
         {
-            return Err("不支持的语言设置。".into());
+            return Err(crate::locale::text("unsupported_language_setting"));
         }
         for (index, rule) in self.rules.iter().enumerate() {
             if rule.path.is_empty() || rule.class.is_empty() {
-                return Err("配置规则缺少程序路径或窗口类名。".into());
+                return Err(crate::locale::text(
+                    "a_configuration_rule_is_missing_its_application",
+                ));
             }
             rule.options.validate()?;
             if self.rules[..index].iter().any(|other| other.same_key(rule)) {
-                return Err("配置中存在重复规则。".into());
+                return Err(crate::locale::text(
+                    "configuration_contains_duplicate_rules",
+                ));
             }
         }
         Ok(())
@@ -134,10 +138,17 @@ impl Store {
 
     fn load_path(path: Option<PathBuf>) -> (Self, Config, Option<String>) {
         let result = match &path {
-            None => Err("无法获取 LOCALAPPDATA，配置保存不可用。".into()),
+            None => Err(crate::locale::text(
+                "localappdata_unavailable_cannot_save_configuration",
+            )),
             Some(path) => match fs::read(path) {
                 Ok(bytes) => serde_json::from_slice::<Config>(&bytes)
-                    .map_err(|e| format!("配置读取失败：{e}。原文件未修改。"))
+                    .map_err(|e| {
+                        crate::locale::format(
+                            "cannot_read_configuration_e_original_file_unchanged",
+                            &[("e", &format!("{}", e))],
+                        )
+                    })
                     .and_then(|mut config| {
                         if config.version == 1 {
                             if config.version == 1 {
@@ -154,7 +165,10 @@ impl Store {
                         Ok(config)
                     }),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
-                Err(e) => Err(format!("配置读取失败：{e}")),
+                Err(e) => Err(crate::locale::format(
+                    "cannot_read_configuration_e",
+                    &[("e", &format!("{}", e))],
+                )),
             },
         };
         match result {
@@ -179,10 +193,15 @@ impl Store {
 
     pub fn save(&self, config: &Config) -> Result<(), String> {
         if !self.writable {
-            return Err("配置不可写，请先修复或移走原配置后重启。".into());
+            return Err(crate::locale::text(
+                "configuration_is_read_only_repair_or_move",
+            ));
         }
         config.validate()?;
-        let path = self.path.as_ref().ok_or("配置目录不可用。")?;
+        let path = self
+            .path
+            .as_ref()
+            .ok_or(crate::locale::text("configuration_directory_unavailable"))?;
         let bytes = serde_json::to_vec_pretty(config).map_err(|e| e.to_string())?;
         atomic_write(path, &bytes)
     }
@@ -192,6 +211,22 @@ impl Store {
 mod tests {
     use super::*;
     use windows::Win32::Foundation::HWND;
+
+    #[test]
+    fn language_is_optional_and_does_not_change_config_version() {
+        let mut config: Config = serde_json::from_str("{\"version\":2,\"rules\":[]}").unwrap();
+        assert!(config.language.is_none());
+        for language in ["zh-CN", "en-US"] {
+            config.language = Some(language.into());
+            assert!(config.validate().is_ok());
+            let restored: Config =
+                serde_json::from_str(&serde_json::to_string(&config).unwrap()).unwrap();
+            assert_eq!(restored.language, config.language);
+            assert_eq!(restored.version, 2);
+        }
+        config.language = Some("invalid".into());
+        assert!(config.validate().is_err());
+    }
 
     fn target() -> WindowInfo {
         WindowInfo {

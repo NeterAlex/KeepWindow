@@ -55,7 +55,7 @@ impl Calibration {
     pub fn new(target: WindowInfo, options: Options) -> Result<Self, String> {
         unsafe {
             if !target.is_same_window() {
-                return Err("目标窗口已关闭。".into());
+                return Err(crate::locale::text("target_window_closed"));
             }
             let instance = GetModuleHandleW(None).map_err(|e| e.to_string())?;
             let class = WNDCLASSW {
@@ -73,7 +73,12 @@ impl Calibration {
             let frame = CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
                 class.lpszClassName,
-                w!("拖动移动，右下角缩放"),
+                windows::core::PCWSTR(
+                    crate::window::wide(&crate::locale::text(
+                        "drag_to_move_resize_from_bottom_right",
+                    ))
+                    .as_ptr(),
+                ),
                 WS_POPUP,
                 rect.left,
                 rect.top,
@@ -99,7 +104,9 @@ impl Calibration {
             let toolbar = match CreateWindowExW(
                 WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
                 class.lpszClassName,
-                w!("校准遮罩"),
+                windows::core::PCWSTR(
+                    crate::window::wide(&crate::locale::text("calibrate_shield")).as_ptr(),
+                ),
                 WS_POPUP,
                 rect.left - 180,
                 rect.bottom + 8,
@@ -121,7 +128,12 @@ impl Calibration {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("STATIC"),
-                    w!("拖动移动 / 右下角缩放 / Enter 保存"),
+                    windows::core::PCWSTR(
+                        crate::window::wide(&crate::locale::text(
+                            "drag_resize_bottom_right_enter_to_save",
+                        ))
+                        .as_ptr(),
+                    ),
                     WS_CHILD | WS_VISIBLE,
                     8,
                     6,
@@ -135,7 +147,9 @@ impl Calibration {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("BUTTON"),
-                    w!("保存"),
+                    windows::core::PCWSTR(
+                        crate::window::wide(&crate::locale::text("save")).as_ptr(),
+                    ),
                     WS_CHILD | WS_VISIBLE,
                     72,
                     32,
@@ -149,7 +163,9 @@ impl Calibration {
                 CreateWindowExW(
                     WINDOW_EX_STYLE(0),
                     w!("BUTTON"),
-                    w!("取消 (Esc)"),
+                    windows::core::PCWSTR(
+                        crate::window::wide(&crate::locale::text("cancel_esc")).as_ptr(),
+                    ),
                     WS_CHILD | WS_VISIBLE,
                     170,
                     32,

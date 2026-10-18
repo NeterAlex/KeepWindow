@@ -31,14 +31,16 @@ pub struct Identity {
 
 impl Identity {
     pub fn capture(target: &WindowInfo) -> Result<Self, String> {
-        let creation = window::process_creation(target.pid).ok_or(
-            "无法读取目标进程创建时间。请检查权限，管理员窗口需要以管理员身份启动 KeepWindow。",
-        )?;
-        let path = window::process_path(target.pid).ok_or(
-            "无法读取目标程序路径。请检查权限，管理员窗口需要以管理员身份启动 KeepWindow。",
-        )?;
+        let creation = window::process_creation(target.pid).ok_or(crate::locale::text(
+            "cannot_read_target_process_creation_time_check",
+        ))?;
+        let path = window::process_path(target.pid).ok_or(crate::locale::text(
+            "cannot_read_target_application_path_check_permissions",
+        ))?;
         if !target.is_same_window() || window::process_creation(target.pid) != Some(creation) {
-            return Err("目标窗口已关闭或重建，请重新选择。".into());
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_select",
+            ));
         }
         Ok(Self {
             hwnd: target.hwnd.0 as usize as u64,
@@ -126,10 +128,9 @@ impl Recovery {
         let mut report = Report::default();
         let mut interrupted = false;
         let result = (|| -> Result<(), String> {
-            let path = journal
-                .path
-                .as_ref()
-                .ok_or("无法获取 LOCALAPPDATA，系统关闭保护不可用。")?;
+            let path = journal.path.as_ref().ok_or(crate::locale::text(
+                "localappdata_unavailable_system_close_protection_unavailable",
+            ))?;
             interrupted = path.with_file_name("running").exists();
             match fs::read(path) {
                 Ok(bytes) => match serde_json::from_slice::<Log>(&bytes) {
@@ -148,15 +149,25 @@ impl Recovery {
                     }
                     _ => {
                         let backup = journal.backup_path("corrupt")?;
-                        fs::rename(path, &backup)
-                            .map_err(|e| format!("损坏恢复日志备份失败：{e}"))?;
-                        report
-                            .errors
-                            .push(format!("恢复日志损坏，已备份到 {}。", backup.display()));
+                        fs::rename(path, &backup).map_err(|e| {
+                            crate::locale::format(
+                                "cannot_back_up_corrupt_recovery_journal_e",
+                                &[("e", &format!("{}", e))],
+                            )
+                        })?;
+                        report.errors.push(crate::locale::format(
+                            "recovery_journal_corrupted_backed_up_to",
+                            &[("value1", &format!("{}", backup.display()))],
+                        ));
                     }
                 },
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("恢复日志读取失败：{e}")),
+                Err(e) => {
+                    return Err(crate::locale::format(
+                        "cannot_read_recovery_journal_e",
+                        &[("e", &format!("{}", e))],
+                    ));
+                }
             }
             // Recover leftover records even if a previous marker deletion was interrupted.
             for record in journal.records.clone() {
@@ -226,12 +237,14 @@ impl Recovery {
             || report.restored + report.skipped + report.failed > 0
             || !report.errors.is_empty()
         {
-            Some(format!(
-                "启动恢复：成功 {}，跳过 {}（身份不匹配或无法验证，已保留备份），失败 {}。{}",
-                report.restored,
-                report.skipped,
-                report.failed,
-                report.errors.join("；")
+            Some(crate::locale::format(
+                "startup_recovery_restored_skipped_identity_mismatch_or",
+                &[
+                    ("value1", &format!("{}", report.restored)),
+                    ("value2", &format!("{}", report.skipped)),
+                    ("value3", &format!("{}", report.failed)),
+                    ("value4", &report.errors.join("；").to_string()),
+                ],
             ))
         } else {
             None
@@ -252,7 +265,9 @@ impl Recovery {
             .iter()
             .any(|record| record.identity.hwnd == identity.hwnd)
         {
-            return Err("该窗口存在待恢复记录，请先重启 KeepWindow 完成恢复。".into());
+            return Err(crate::locale::text(
+                "this_window_has_a_pending_recovery_record",
+            ));
         }
         let mut records = journal.records.clone();
         records.push(Record {
@@ -271,14 +286,24 @@ impl Recovery {
     pub fn finish(&self) -> Result<(), String> {
         let journal = self.0.borrow();
         if !journal.writable || !journal.records.is_empty() {
-            return Err("恢复日志仍有待恢复项，保留运行标记供下次启动重试。".into());
+            return Err(crate::locale::text(
+                "recovery_journal_still_has_pending_entries_keeping",
+            ));
         }
-        let path = journal.path.as_ref().ok_or("恢复目录不可用。")?;
+        let path = journal
+            .path
+            .as_ref()
+            .ok_or(crate::locale::text("recovery_directory_unavailable"))?;
         for file in [path.clone(), path.with_file_name("running")] {
             match fs::remove_file(file) {
                 Ok(()) => {}
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-                Err(e) => return Err(format!("清理恢复标记失败：{e}")),
+                Err(e) => {
+                    return Err(crate::locale::format(
+                        "cannot_remove_recovery_marker_e",
+                        &[("e", &format!("{}", e))],
+                    ));
+                }
             }
         }
         Ok(())
@@ -312,20 +337,29 @@ impl Journal {
         Ok(self
             .path
             .as_ref()
-            .ok_or("恢复目录不可用。")?
+            .ok_or(crate::locale::text("recovery_directory_unavailable"))?
             .with_file_name(format!("recovery-{kind}-{}.json", nonce())))
     }
     fn commit(&mut self, records: Vec<Record>) -> Result<(), String> {
         if !self.writable {
-            return Err("恢复日志不可写，无法安全修改系统关闭项。".into());
+            return Err(crate::locale::text(
+                "recovery_journal_is_read_only_cannot_safely",
+            ));
         }
         let bytes = serde_json::to_vec_pretty(&Log {
             version: 1,
             records: records.clone(),
         })
         .map_err(|e| e.to_string())?;
-        atomic_write(self.path.as_ref().ok_or("恢复目录不可用。")?, &bytes)
-            .map_err(|e| format!("恢复日志保存失败：{e}"))?;
+        atomic_write(
+            self.path
+                .as_ref()
+                .ok_or(crate::locale::text("recovery_directory_unavailable"))?,
+            &bytes,
+        )
+        .map_err(|e| {
+            crate::locale::format("cannot_save_recovery_journal_e", &[("e", &e.to_string())])
+        })?;
         self.records = records;
         Ok(())
     }

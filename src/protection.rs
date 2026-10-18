@@ -59,7 +59,7 @@ impl Default for Options {
 impl Options {
     pub fn validate(&self) -> Result<(), String> {
         if !self.system_menu && !self.mouse_shield {
-            return Err("请至少启用一种保护方式。".into());
+            return Err(crate::locale::text("enable_at_least_one_protection_method"));
         }
         if !(1..=512).contains(&self.width)
             || !(1..=512).contains(&self.height)
@@ -67,7 +67,9 @@ impl Options {
             || !(-512..=512).contains(&self.top_offset)
             || !(5..=80).contains(&self.opacity)
         {
-            return Err("遮罩尺寸、偏移或透明度超出允许范围。".into());
+            return Err(crate::locale::text(
+                "shield_size_offset_or_opacity_is_outside",
+            ));
         }
         Ok(())
     }
@@ -82,31 +84,41 @@ pub struct ProtectionStatus {
 }
 
 impl ProtectionStatus {
-    pub fn label(&self) -> &'static str {
+    pub fn label(&self) -> String {
         if self.recovery_failed {
-            "恢复失败"
+            crate::locale::text("restoration_failed")
         } else {
             match (self.system_menu, self.mouse_shield) {
-                (true, true) => "组合保护",
-                (true, false) => "系统保护",
-                (false, true) => "鼠标保护",
-                _ => "未保护",
+                (true, true) => crate::locale::text("combined_protection"),
+                (true, false) => crate::locale::text("system_protection_2"),
+                (false, true) => crate::locale::text("mouse_protection"),
+                _ => crate::locale::text("unprotected_2"),
             }
         }
     }
     pub fn description(&self) -> String {
-        let mut text = format!(
-            "系统保护：{}；鼠标保护：{}（需确认覆盖位置）",
-            if self.system_menu {
-                "生效"
-            } else {
-                "未生效"
-            },
-            if self.mouse_shield {
-                "生效"
-            } else {
-                "未生效"
-            }
+        let mut text = crate::locale::format(
+            "system_protection_mouse_protection_confirm_coverage_position",
+            &[
+                (
+                    "value1",
+                    &(if self.system_menu {
+                        crate::locale::text("active")
+                    } else {
+                        crate::locale::text("inactive")
+                    })
+                    .to_string(),
+                ),
+                (
+                    "value2",
+                    &(if self.mouse_shield {
+                        crate::locale::text("active")
+                    } else {
+                        crate::locale::text("inactive")
+                    })
+                    .to_string(),
+                ),
+            ],
         );
         if let Some(error) = &self.error {
             text.push_str(&format!("；{error}"));
@@ -195,7 +207,9 @@ impl Protection {
     ) -> Result<Self, String> {
         options.validate()?;
         if !target.is_same_window() {
-            return Err("目标窗口已关闭，请刷新窗口列表。".into());
+            return Err(crate::locale::text(
+                "target_window_closed_refresh_the_window_list",
+            ));
         }
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
@@ -221,8 +235,17 @@ impl Protection {
         };
         unsafe {
             // A property disappears with the window, so a recycled HWND is never restored or shielded.
-            SetPropW(protection.target.hwnd, PCWSTR(protection.marker.as_ptr()), Some(HANDLE(std::ptr::dangling_mut())))
-                .map_err(|error| format!("无法访问目标窗口：{error}\n如果目标以管理员身份运行，请也以管理员身份启动 KeepWindow。"))?;
+            SetPropW(
+                protection.target.hwnd,
+                PCWSTR(protection.marker.as_ptr()),
+                Some(HANDLE(std::ptr::dangling_mut())),
+            )
+            .map_err(|error| {
+                crate::locale::format(
+                    "cannot_access_target_window_error_if_the",
+                    &[("error", &format!("{}", error))],
+                )
+            })?;
         }
         if options.system_menu {
             let menu = unsafe { GetSystemMenu(protection.target.hwnd, false) };
@@ -231,14 +254,18 @@ impl Protection {
             if has_close || !options.mouse_shield {
                 protection.disable_close()?;
             } else {
-                protection.error = Some("目标没有标准关闭项，仅鼠标保护生效。".into());
+                protection.error = Some(crate::locale::text(
+                    "target_has_no_standard_close_item_only",
+                ));
             }
         }
         if options.mouse_shield {
-            protection.overlay = Some(
-                create_overlay(options.opacity)
-                    .map_err(|error| format!("无法创建鼠标遮罩：{error}"))?,
-            );
+            protection.overlay = Some(create_overlay(options.opacity).map_err(|error| {
+                crate::locale::format(
+                    "cannot_create_mouse_shield_error",
+                    &[("error", &format!("{}", error))],
+                )
+            })?);
             protection.mouse = Some(MouseRegistration::new(
                 protection.target.hwnd,
                 protection.overlay,
@@ -273,10 +300,12 @@ impl Protection {
     pub fn update_options(&mut self, options: Options) -> Result<(), String> {
         options.validate()?;
         if !self.alive() {
-            return Err("目标窗口已关闭。".into());
+            return Err(crate::locale::text("target_window_closed"));
         }
         if self.recovery_failed {
-            return Err("请先重试恢复，再开启保护。".into());
+            return Err(crate::locale::text(
+                "retry_restoration_before_enabling_protection",
+            ));
         }
         if options.mouse_shield {
             shield_rect(self.target.hwnd, options)?;
@@ -310,7 +339,12 @@ impl Protection {
                     LWA_ALPHA,
                 )
             }
-            .map_err(|e| format!("无法更新遮罩透明度：{e}"))?;
+            .map_err(|e| {
+                crate::locale::format(
+                    "cannot_update_shield_opacity_e",
+                    &[("e", &format!("{}", e))],
+                )
+            })?;
         }
         let result = (|| {
             if options.system_menu && self.menu.is_none() {
@@ -371,7 +405,7 @@ impl Protection {
         }
         self.options = options;
         self.error = (options.system_menu && self.menu.is_none())
-            .then(|| "目标没有标准关闭项，仅鼠标保护生效。".into());
+            .then(|| crate::locale::text("target_has_no_standard_close_item_only"));
         Ok(())
     }
 
@@ -391,16 +425,22 @@ impl Protection {
 
     pub fn tick(&mut self) -> Result<(), String> {
         if !self.alive() {
-            return Err("目标窗口已关闭或重建，保护已结束。".into());
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_protection",
+            ));
         }
         if let Some(menu) = &self.menu {
             unsafe {
                 if GetSystemMenu(self.target.hwnd, false) != menu.menu {
-                    return Err("目标重建了系统菜单，请重新开启保护。".into());
+                    return Err(crate::locale::text(
+                        "target_recreated_its_system_menu_enable_protection",
+                    ));
                 }
                 let state = GetMenuState(menu.menu, SC_CLOSE, MF_BYCOMMAND);
                 if state == u32::MAX {
-                    return Err("目标移除了系统关闭命令，请改用鼠标遮罩。".into());
+                    return Err(crate::locale::text(
+                        "target_removed_the_system_close_command_use",
+                    ));
                 }
                 if state & (MF_DISABLED.0 | MF_GRAYED.0) == 0 {
                     set_close_state(self.target.hwnd, menu.menu, MF_GRAYED)?;
@@ -430,7 +470,12 @@ impl Protection {
                     rect.bottom - rect.top,
                     SWP_NOACTIVATE | SWP_SHOWWINDOW,
                 )
-                .map_err(|error| format!("无法移动鼠标遮罩：{error}"))?;
+                .map_err(|error| {
+                    crate::locale::format(
+                        "cannot_move_mouse_shield_error",
+                        &[("error", &format!("{}", error))],
+                    )
+                })?;
             }
         }
         Ok(())
@@ -501,7 +546,9 @@ impl Protection {
             || !Identity::capture(&self.target).is_ok_and(|current| identity.matches(&current))
         {
             self.clear_record()?;
-            return Err("目标窗口已关闭或重建，请重新选择。".into());
+            return Err(crate::locale::text(
+                "target_window_closed_or_was_recreated_select",
+            ));
         }
         self.menu = Some(MenuProtection {
             menu,
@@ -535,7 +582,9 @@ pub fn original_close_state(hwnd: HWND) -> Result<u32, String> {
             GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND)
         };
         if state == u32::MAX {
-            return Err("目标没有标准系统关闭命令。请取消“禁用系统关闭”，启用“鼠标遮罩”。".into());
+            return Err(crate::locale::text(
+                "target_has_no_standard_system_close_command",
+            ));
         }
         Ok(state & (MF_DISABLED.0 | MF_GRAYED.0))
     }
@@ -554,12 +603,16 @@ fn set_close_state(hwnd: HWND, menu: HMENU, state: MENU_ITEM_FLAGS) -> Result<()
     unsafe {
         // EnableMenuItem returns the PREVIOUS flags: zero is a successful previously enabled item.
         if EnableMenuItem(menu, SC_CLOSE, MF_BYCOMMAND | state).0 == -1 {
-            return Err("修改关闭命令失败。请检查目标窗口权限。".into());
+            return Err(crate::locale::text(
+                "could_not_modify_the_close_command_check",
+            ));
         }
         let observed = GetMenuState(menu, SC_CLOSE, MF_BYCOMMAND);
         let mask = MF_DISABLED.0 | MF_GRAYED.0;
         if observed == u32::MAX || (observed & mask != 0) != (state.0 & mask != 0) {
-            return Err("目标窗口拒绝了关闭命令修改。".into());
+            return Err(crate::locale::text(
+                "target_window_rejected_the_close_command_change",
+            ));
         }
         let _ = DrawMenuBar(hwnd);
         let _ = SetWindowPos(

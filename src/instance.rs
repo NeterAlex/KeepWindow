@@ -83,7 +83,9 @@ impl Instance {
             }
             std::thread::sleep(Duration::from_millis(50));
         }
-        Err("已有 KeepWindow 实例未响应。请检查现有进程后重试。".into())
+        Err(crate::locale::text(
+            "the_existing_keepwindow_instance_is_not_responding",
+        ))
     }
 
     fn open(name: &str) -> Result<(Self, bool), String> {
@@ -96,7 +98,12 @@ impl Instance {
                 &mut descriptor,
                 None,
             )
-            .map_err(|e| format!("无法创建单实例权限：{e}"))?;
+            .map_err(|e| {
+                crate::locale::format(
+                    "cannot_create_single_instance_permissions_e",
+                    &[("e", &format!("{}", e))],
+                )
+            })?;
             let attributes = SECURITY_ATTRIBUTES {
                 nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
                 lpSecurityDescriptor: descriptor.0,
@@ -106,9 +113,12 @@ impl Instance {
             let result = CreateMutexExW(Some(&attributes), PCWSTR(name.as_ptr()), 0, 0x00100000);
             let existing = GetLastError() == ERROR_ALREADY_EXISTS;
             let _ = LocalFree(Some(HLOCAL(descriptor.0)));
-            result
-                .map(|handle| (Self(handle), existing))
-                .map_err(|e| format!("无法取得单实例锁：{e}"))
+            result.map(|handle| (Self(handle), existing)).map_err(|e| {
+                crate::locale::format(
+                    "cannot_acquire_single_instance_lock_e",
+                    &[("e", &format!("{}", e))],
+                )
+            })
         }
     }
 }

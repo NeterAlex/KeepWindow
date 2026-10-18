@@ -116,7 +116,12 @@ impl From<Options> for Draft {
 }
 
 impl KeepWindow {
-    fn switch_language(&mut self, language: crate::locale::Language, cx: &mut Context<Self>) {
+    fn switch_language(
+        &mut self,
+        language: crate::locale::Language,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
         let previous = self.config.language.clone();
         crate::locale::set(language);
         let mut config = self.config.clone();
@@ -138,17 +143,45 @@ impl KeepWindow {
                 self.status = error.into();
             }
         }
+        for (input, key) in [
+            (&self.width, "width"),
+            (&self.height, "height"),
+            (&self.right_offset, "right_inset"),
+            (&self.top_offset, "top_offset"),
+            (&self.search, "search_hint"),
+            (&self.title_contains, "title_keyword_optional"),
+            (&self.rule_name, "rule_name_optional"),
+            (&self.transfer_path, "full_path_to_rules_json_file"),
+        ] {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(crate::locale::text(key), window, cx)
+            });
+        }
+        for input in &self.hotkey_inputs {
+            input.update(cx, |input, cx| {
+                input.set_placeholder(
+                    crate::locale::text("leave_empty_to_disable_e_g_ctrl"),
+                    window,
+                    cx,
+                )
+            });
+        }
+        self.table.update(cx, |table, cx| {
+            table.delegate_mut().localize_columns();
+            cx.notify();
+        });
+        if let Some(tray) = &self.tray {
+            tray.refresh_language();
+        }
+        self.rebuild_table(cx);
         cx.notify();
     }
     fn record_status(&mut self) {
         let message = self.status.to_string();
-        if self
-            .events
-            .entries
-            .back()
-            .is_none_or(|event| event.source != "操作" || event.detail != message)
-        {
-            self.events.push("操作", message);
+        if self.events.entries.back().is_none_or(|event| {
+            event.source != crate::locale::text("action") || event.detail != message
+        }) {
+            self.events.push(&crate::locale::text("action"), message);
         }
     }
 
@@ -172,7 +205,9 @@ impl KeepWindow {
         {
             self.releases.remove(index);
             self.suppressed.push(target);
-            self.status = "已取消临时放行后的自动恢复。".into();
+            self.status =
+                crate::locale::text("automatic_restoration_after_temporary_release_canceled")
+                    .into();
         } else if let Some(index) = self
             .protections
             .iter()
@@ -182,7 +217,8 @@ impl KeepWindow {
             match self.protections[index].restore() {
                 Ok(()) => {
                     self.protections.remove(index);
-                    self.status = "已解除前台窗口保护。".into();
+                    self.status =
+                        crate::locale::text("foreground_window_protection_removed").into();
                 }
                 Err(error) => self.status = error.into(),
             }
@@ -200,7 +236,7 @@ impl KeepWindow {
             match Protection::start_logged(target, options, self.recovery.clone()) {
                 Ok(protection) => {
                     self.protections.push(protection);
-                    self.status = "已保护前台窗口。".into();
+                    self.status = crate::locale::text("foreground_window_protected").into();
                 }
                 Err(error) => self.status = error.into(),
             }
@@ -219,7 +255,7 @@ impl KeepWindow {
             .find(|release| release.target.same_identity(&target))
         {
             release.deadline = Instant::now() + Duration::from_secs(10);
-            self.status = "临时放行已重置为 10 秒。".into();
+            self.status = crate::locale::text("temporary_release_reset_to_seconds").into();
         } else if let Some(index) = self
             .protections
             .iter()
@@ -239,12 +275,20 @@ impl KeepWindow {
                 Ok(release) => {
                     self.protections.remove(index);
                     self.releases.push(release);
-                    self.status = "已临时放行，10 秒后恢复保护。".into();
+                    self.status =
+                        crate::locale::text("temporarily_released_protection_resumes_in_seconds")
+                            .into();
                 }
-                Err(error) => self.status = format!("临时放行失败：{error}").into(),
+                Err(error) => {
+                    self.status = crate::locale::format(
+                        "temporary_release_failed_error",
+                        &[("error", &error.to_string())],
+                    )
+                    .into()
+                }
             }
         } else {
-            self.status = "目标窗口尚未保护。".into();
+            self.status = crate::locale::text("the_target_window_is_not_protected").into();
         }
         self.rebuild_table(cx);
         cx.notify();
@@ -257,8 +301,10 @@ impl KeepWindow {
             if !crate::recovery::Identity::capture(&release.target)
                 .is_ok_and(|current| release.identity.matches(&current))
             {
-                self.events
-                    .push("临时放行", "窗口已关闭或身份无法验证，取消恢复。");
+                self.events.push(
+                    &crate::locale::text("temporary_release"),
+                    crate::locale::text("window_closed_or_identity_could_not_be"),
+                );
                 changed = true;
             } else if Instant::now() < release.deadline
                 || self.picker.is_some()
@@ -274,17 +320,22 @@ impl KeepWindow {
                 ) {
                     Ok(protection) => {
                         self.protections.push(protection);
-                        self.status = "临时放行结束，保护已恢复。".into();
+                        self.status =
+                            crate::locale::text("temporary_release_ended_protection_restored")
+                                .into();
                     }
                     Err(error) => {
-                        self.status =
-                            format!("临时放行后恢复保护失败：{error}；可选中窗口重试。").into();
+                        self.status = crate::locale::format(
+                            "could_not_restore_protection_after_release_error",
+                            &[("error", &error.to_string())],
+                        )
+                        .into();
                         self.suppressed.push(release.target.clone());
                         let path = window::process_path(release.target.pid).unwrap_or_default();
                         self.attempts.push(Attempt::failed(
                             release.target.clone(),
                             Rule {
-                                name: "临时放行恢复".into(),
+                                name: crate::locale::text("restore_after_temporary_release"),
                                 path,
                                 class: release.target.class.clone(),
                                 title_contains: String::new(),
@@ -325,7 +376,7 @@ impl KeepWindow {
             match Protection::start_logged(target, options, self.recovery.clone()) {
                 Ok(protection) => {
                     self.protections.push(protection);
-                    self.status = "重试保护成功。".into();
+                    self.status = crate::locale::text("protection_retry_succeeded").into();
                 }
                 Err(error) => self.status = error.into(),
             }
@@ -348,7 +399,9 @@ impl KeepWindow {
         let result = self
             .hotkeys
             .as_mut()
-            .ok_or_else(|| "托盘不可用，无法注册快捷键。".to_string())
+            .ok_or_else(|| {
+                crate::locale::text("tray_unavailable_cannot_register_hotkeys").to_string()
+            })
             .and_then(|keys| keys.replace(&values));
         match result {
             Ok(()) => {
@@ -357,7 +410,7 @@ impl KeepWindow {
                 match self.store.save(&config) {
                     Ok(()) => {
                         self.config = config;
-                        self.status = "快捷键设置已保存。".into();
+                        self.status = crate::locale::text("hotkey_settings_saved").into();
                     }
                     Err(error) => {
                         let rollback = self.hotkeys.as_mut().unwrap().replace(&previous);
@@ -365,7 +418,10 @@ impl KeepWindow {
                             "{error}{}",
                             rollback
                                 .err()
-                                .map(|error| format!("；恢复原快捷键失败：{error}"))
+                                .map(|error| crate::locale::format(
+                                    "could_not_restore_previous_hotkeys_error",
+                                    &[("error", &error.to_string())]
+                                ))
                                 .unwrap_or_default()
                         )
                         .into();
@@ -380,7 +436,7 @@ impl KeepWindow {
     fn transfer_rules(&mut self, import: bool, cx: &mut Context<Self>) {
         let path = std::path::PathBuf::from(self.transfer_path.read(cx).value().trim());
         let result = if !path.is_absolute() {
-            Err("请输入 JSON 文件的完整绝对路径。".into())
+            Err(crate::locale::text("enter_the_full_absolute_path_of_a"))
         } else if import {
             std::fs::read(&path)
                 .map_err(|e| e.to_string())
@@ -404,19 +460,27 @@ impl KeepWindow {
                         .count();
                     let count = rules.len();
                     self.imported = Some(rules);
-                    Ok(format!(
-                        "导入预览：新增 {} 条，冲突 {conflicts} 条。选择保留已有或覆盖。",
-                        count - conflicts
+                    Ok(crate::locale::format(
+                        "import_preview_new_rules_conflicts_conflicts_choose",
+                        &[
+                            ("value1", &format!("{}", count - conflicts)),
+                            ("conflicts", &format!("{}", conflicts)),
+                        ],
                     ))
                 })
         } else {
             serde_json::to_vec_pretty(&self.config.rules)
                 .map_err(|e| e.to_string())
                 .and_then(|bytes| crate::storage::atomic_write(&path, &bytes))
-                .map(|()| "规则已导出（仅含规则）。".into())
+                .map(|()| crate::locale::text("rules_exported_rules_only"))
         };
         self.status = result
-            .unwrap_or_else(|error| format!("规则传输失败：{error}"))
+            .unwrap_or_else(|error| {
+                crate::locale::format(
+                    "rule_transfer_failed_error",
+                    &[("error", &error.to_string())],
+                )
+            })
             .into();
         cx.notify();
     }
@@ -450,39 +514,57 @@ impl KeepWindow {
     }
 
     fn diagnostic(&self) -> String {
-        let mut text = format!(
-            "KeepWindow {}\nWindows {}\n保护：{}\n待重试：{}\n临时放行：{}\n",
-            env!("CARGO_PKG_VERSION"),
-            std::env::var("OS").unwrap_or_else(|_| "Windows".into()),
-            self.protections.len(),
-            self.attempts.len(),
-            self.releases.len()
+        let mut text = crate::locale::format(
+            "keepwindow_windows_protected_awaiting_retry_temporarily_released",
+            &[
+                ("value1", env!("CARGO_PKG_VERSION")),
+                (
+                    "value2",
+                    &std::env::var("OS")
+                        .unwrap_or_else(|_| "Windows".into())
+                        .to_string(),
+                ),
+                ("value3", &format!("{}", self.protections.len())),
+                ("value4", &format!("{}", self.attempts.len())),
+                ("value5", &format!("{}", self.releases.len())),
+            ],
         );
         if self.include_private {
             for event in &self.events.entries {
-                text.push_str(&format!(
-                    "{} [{}] {} ({} 次)\n",
-                    event.time, event.source, event.detail, event.count
+                text.push_str(&crate::locale::format(
+                    "times",
+                    &[
+                        ("value1", &format!("{}", event.time)),
+                        ("value2", &event.source.to_string()),
+                        ("value3", &event.detail.to_string()),
+                        ("value4", &format!("{}", event.count)),
+                    ],
                 ));
             }
             for target in &self.windows {
                 text.push_str(&format!(
                     "{} | {}\n",
                     target.display_title(),
-                    self.path_for(target).unwrap_or("未知路径")
+                    self.path_for(target)
+                        .unwrap_or(&crate::locale::text("unknown_path"))
                 ));
             }
         } else {
-            text.push_str("隐私模式：窗口标题、路径和自由文本错误已省略。\n");
+            text.push_str(&crate::locale::text(
+                "privacy_mode_window_titles_paths_and_free",
+            ));
             for attempt in &self.attempts {
-                text.push_str(if attempt.waiting() {
-                    "保护失败：等待重试\n"
+                text.push_str(&if attempt.waiting() {
+                    crate::locale::text("protection_failed_awaiting_retry")
                 } else {
-                    "保护失败：需要手动处理\n"
+                    crate::locale::text("protection_failed_manual_action_required")
                 });
             }
             for protection in &self.protections {
-                text.push_str(&format!("状态：{}\n", protection.status().label()));
+                text.push_str(&crate::locale::format(
+                    "status",
+                    &[("value1", &protection.status().label().to_string())],
+                ));
             }
         }
         text
@@ -494,12 +576,19 @@ impl KeepWindow {
         recovery: Recovery,
         recovery_message: Option<String>,
     ) -> Self {
+        let (store, config, config_error) = Store::load();
+        crate::locale::set(crate::locale::from_config(config.language.as_deref()));
         window.set_window_title("KeepWindow");
         let tray = HasWindowHandle::window_handle(window)
-            .map_err(|error| format!("无法获取主窗口句柄：{error}"))
+            .map_err(|error| {
+                crate::locale::format(
+                    "cannot_get_main_window_handle_error",
+                    &[("error", &format!("{}", error))],
+                )
+            })
             .and_then(|handle| match handle.as_raw() {
                 RawWindowHandle::Win32(handle) => Tray::new(HWND(handle.hwnd.get() as *mut _)),
-                _ => Err("主窗口不是 Windows 窗口。".into()),
+                _ => Err(crate::locale::text("main_window_is_not_a_windows_window")),
             });
         let view = cx.weak_entity();
         window.on_window_should_close(cx, move |_, cx| {
@@ -515,7 +604,7 @@ impl KeepWindow {
         });
         let width = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("宽度")
+                .placeholder(crate::locale::text("width"))
                 .default_value("46")
                 .step(1.)
                 .min(1.)
@@ -523,7 +612,7 @@ impl KeepWindow {
         });
         let height = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("高度")
+                .placeholder(crate::locale::text("height"))
                 .default_value("32")
                 .step(1.)
                 .min(1.)
@@ -531,7 +620,7 @@ impl KeepWindow {
         });
         let right_offset = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("右侧内缩")
+                .placeholder(crate::locale::text("right_inset"))
                 .default_value("0")
                 .step(1.)
                 .min(-512.)
@@ -539,14 +628,16 @@ impl KeepWindow {
         });
         let top_offset = cx.new(|cx| {
             InputState::new(window, cx)
-                .placeholder("顶部下移")
+                .placeholder(crate::locale::text("top_offset"))
                 .default_value("0")
                 .step(1.)
                 .min(-512.)
                 .max(512.)
         });
-        let search =
-            cx.new(|cx| InputState::new(window, cx).placeholder("搜索窗口名称、PID 或句柄"));
+        let search = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::text("search_window_name_pid_or_handle"))
+        });
         let opacity = cx.new(|cx| {
             InputState::new(window, cx)
                 .default_value("28")
@@ -554,20 +645,24 @@ impl KeepWindow {
                 .min(5.)
                 .max(80.)
         });
-        let title_contains =
-            cx.new(|cx| InputState::new(window, cx).placeholder("标题关键词（可选）"));
-        let (store, config, config_error) = Store::load();
-        crate::locale::set(crate::locale::from_config(config.language.as_deref()));
+        let title_contains = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::text("title_keyword_optional"))
+        });
+
         let hotkey_inputs = std::array::from_fn(|index| {
             cx.new(|cx| {
                 InputState::new(window, cx)
-                    .placeholder("留空禁用，如 Ctrl+Alt+K")
+                    .placeholder(crate::locale::text("leave_empty_to_disable_e_g_ctrl"))
                     .default_value(config.hotkeys[index].clone())
             })
         });
-        let rule_name = cx.new(|cx| InputState::new(window, cx).placeholder("规则名称（可选）"));
-        let transfer_path =
-            cx.new(|cx| InputState::new(window, cx).placeholder("规则 JSON 文件完整路径"));
+        let rule_name = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(crate::locale::text("rule_name_optional"))
+        });
+        let transfer_path = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(crate::locale::text("full_path_to_rules_json_file"))
+        });
         let mut hotkeys = tray.as_ref().ok().map(|tray| Hotkeys::new(tray.hwnd()));
         let hotkey_error = hotkeys
             .as_mut()
@@ -813,7 +908,13 @@ impl KeepWindow {
                 }
                 self.rebuild_table(cx);
             }
-            Err(error) => self.status = format!("刷新失败：{error}").into(),
+            Err(error) => {
+                self.status = crate::locale::format(
+                    "refresh_failed_error",
+                    &[("error", &format!("{}", error))],
+                )
+                .into()
+            }
         }
         cx.notify();
     }
@@ -833,7 +934,10 @@ impl KeepWindow {
                         false
                     }
                     Err(e) => {
-                        ended.push(format!("{error}；恢复失败：{e}"));
+                        ended.push(crate::locale::format(
+                            "error_restore_failed_e",
+                            &[("error", &error.to_string()), ("e", &e.to_string())],
+                        ));
                         true
                     }
                 },
@@ -1049,7 +1153,7 @@ impl KeepWindow {
                     .protection_for(item)
                     .map(|p| {
                         let status = p.status();
-                        (status.label().into(), status.description())
+                        (status.label(), status.description())
                     })
                     .or_else(|| {
                         self.releases
@@ -1057,8 +1161,10 @@ impl KeepWindow {
                             .find(|release| release.target.same_identity(item))
                             .map(|_| {
                                 (
-                                    "临时放行".into(),
-                                    "10 秒后恢复保护；再次放行可重置倒计时。".into(),
+                                    crate::locale::text("temporary_release"),
+                                    crate::locale::text(
+                                        "protection_resumes_in_seconds_release_again_to",
+                                    ),
                                 )
                             })
                     })
@@ -1071,11 +1177,10 @@ impl KeepWindow {
                             .map(|attempt| {
                                 (
                                     if attempt.waiting() {
-                                        "等待重试"
+                                        crate::locale::text("awaiting_retry")
                                     } else {
-                                        "保护失败"
-                                    }
-                                    .into(),
+                                        crate::locale::text("protection_failed")
+                                    },
                                     attempt.error.clone().unwrap(),
                                 )
                             })
@@ -1126,7 +1231,16 @@ impl KeepWindow {
                     .parse::<i32>()
                     .ok()
                     .filter(|v| (min..=max).contains(v))
-                    .ok_or_else(|| format!("{name}必须为 {min} 到 {max} 之间的整数。"))
+                    .ok_or_else(|| {
+                        crate::locale::format(
+                            "name_must_be_an_integer_from_min",
+                            &[
+                                ("name", name),
+                                ("min", &format!("{}", min)),
+                                ("max", &format!("{}", max)),
+                            ],
+                        )
+                    })
             };
         let mut options = Options {
             system_menu: self.system_menu,
@@ -1134,25 +1248,43 @@ impl KeepWindow {
             ..Options::default()
         };
         for (field, input, name, min, max) in [
-            (&mut options.width, &self.width, "遮罩宽度", 1, 512),
-            (&mut options.height, &self.height, "遮罩高度", 1, 512),
+            (
+                &mut options.width,
+                &self.width,
+                crate::locale::text("shield_width"),
+                1,
+                512,
+            ),
+            (
+                &mut options.height,
+                &self.height,
+                crate::locale::text("shield_height"),
+                1,
+                512,
+            ),
             (
                 &mut options.right_offset,
                 &self.right_offset,
-                "右侧内缩",
+                crate::locale::text("right_inset"),
                 -512,
                 512,
             ),
             (
                 &mut options.top_offset,
                 &self.top_offset,
-                "顶部下移",
+                crate::locale::text("top_offset"),
                 -512,
                 512,
             ),
-            (&mut options.opacity, &self.opacity, "透明度", 5, 80),
+            (
+                &mut options.opacity,
+                &self.opacity,
+                crate::locale::text("opacity"),
+                5,
+                80,
+            ),
         ] {
-            match number(input, name, min, max) {
+            match number(input, &name, min, max) {
                 Ok(value) => *field = value,
                 Err(error) if self.mouse_shield => return Err(error.into()),
                 _ => {}
@@ -1163,7 +1295,7 @@ impl KeepWindow {
 
     fn protect(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.selected_window() else {
-            self.status = "请先选择要保护的窗口。".into();
+            self.status = crate::locale::text("select_a_window_to_protect_first").into();
             cx.notify();
             return;
         };
@@ -1179,7 +1311,11 @@ impl KeepWindow {
                 match Protection::start_logged(target.clone(), options, self.recovery.clone()) {
                     Ok(p) => {
                         self.protections.push(p);
-                        self.status = format!("已保护“{}”。", target.display_title()).into();
+                        self.status = crate::locale::format(
+                            "protected",
+                            &[("value1", &target.display_title().to_string())],
+                        )
+                        .into();
                     }
                     Err(e) => self.status = e.into(),
                 }
@@ -1192,7 +1328,7 @@ impl KeepWindow {
 
     fn restore_selected(&mut self, cx: &mut Context<Self>) {
         let Some(target) = self.selected_window() else {
-            self.status = "请先选择要恢复的窗口。".into();
+            self.status = crate::locale::text("select_a_window_to_restore_first").into();
             cx.notify();
             return;
         };
@@ -1201,7 +1337,7 @@ impl KeepWindow {
             .iter()
             .position(|p| p.target.same_identity(&target))
         else {
-            self.status = "所选窗口尚未开启保护。".into();
+            self.status = crate::locale::text("the_selected_window_is_not_protected").into();
             cx.notify();
             return;
         };
@@ -1211,7 +1347,11 @@ impl KeepWindow {
         match self.protections[index].restore() {
             Ok(()) => {
                 self.protections.remove(index);
-                self.status = format!("已恢复“{}”。", target.display_title()).into();
+                self.status = crate::locale::format(
+                    "restored",
+                    &[("value1", &target.display_title().to_string())],
+                )
+                .into();
             }
             Err(e) => self.status = e.into(),
         }
@@ -1242,9 +1382,13 @@ impl KeepWindow {
             }
         });
         self.status = if errors.is_empty() {
-            "已恢复全部窗口。".into()
+            crate::locale::text("all_windows_restored").into()
         } else {
-            format!("部分窗口恢复失败：{}", errors.join("；")).into()
+            crate::locale::format(
+                "some_windows_could_not_be_restored",
+                &[("value1", &errors.join("；").to_string())],
+            )
+            .into()
         };
         self.rebuild_table(cx);
         cx.notify();
@@ -1292,8 +1436,13 @@ impl KeepWindow {
                     self.protections.push(protection);
                     self.attempts
                         .retain(|attempt| !attempt.target.same_identity(&target));
-                    self.events
-                        .push("自动保护", format!("已保护 {}", target.display_title()));
+                    self.events.push(
+                        &crate::locale::text("automatic_protection"),
+                        crate::locale::format(
+                            "protected_2",
+                            &[("value1", &target.display_title().to_string())],
+                        ),
+                    );
                 }
                 Err(error) => {
                     let kind = Protection::failure_kind(&target, &self.recovery);
@@ -1312,8 +1461,15 @@ impl KeepWindow {
                         ));
                         true
                     };
-                    let message = format!("自动保护“{}”失败：{error}", target.display_title());
-                    self.events.push("自动重试", message.clone());
+                    let message = crate::locale::format(
+                        "automatic_protection_of_failed_error",
+                        &[
+                            ("value1", &target.display_title().to_string()),
+                            ("error", &error.to_string()),
+                        ],
+                    );
+                    self.events
+                        .push(&crate::locale::text("automatic_retry"), message.clone());
                     if notify {
                         self.status = message.into();
                         if let Some(tray) = &self.tray {
@@ -1351,11 +1507,13 @@ impl KeepWindow {
             let path = editing
                 .map(|rule| rule.path.as_str())
                 .or_else(|| target.and_then(|target| self.path_for(target)))
-                .ok_or("无法获取程序路径，不能保存规则。")?;
+                .ok_or(crate::locale::text(
+                    "cannot_get_application_path_cannot_save_rule",
+                ))?;
             let class = editing
                 .map(|rule| rule.class.clone())
                 .or_else(|| target.map(|target| target.class.clone()))
-                .ok_or("请先选择窗口。")?;
+                .ok_or(crate::locale::text("select_a_window_first"))?;
             Ok(Rule {
                 name: self.rule_name.read(cx).value().trim().to_string(),
                 path: path.into(),
@@ -1383,7 +1541,7 @@ impl KeepWindow {
                 self.attempts
                     .retain(|attempt| config.rules.iter().any(|current| current == &attempt.rule));
                 self.config = config;
-                self.status = "应用规则已保存。".into();
+                self.status = crate::locale::text("application_rule_saved").into();
             }
             Err(error) => self.status = error.into(),
         }
@@ -1404,24 +1562,27 @@ impl KeepWindow {
         self.automatic = rule.automatic;
         self.editing_rule = Some(index);
         self.rule_settings_open = true;
-        self.status = "正在编辑已保存规则，点击保存完成修改。".into();
+        self.status = crate::locale::text("editing_a_saved_rule_click_save_to").into();
         cx.notify();
     }
 
     fn apply_settings(&mut self, cx: &mut Context<Self>) {
         let result = self.options(cx).and_then(|options| {
-            let target = self.selected.clone().ok_or("请先选择窗口。")?;
+            let target = self
+                .selected
+                .clone()
+                .ok_or(crate::locale::text("select_a_window_first"))?;
             let protection = self
                 .protections
                 .iter_mut()
                 .find(|p| p.target.same_identity(&target))
-                .ok_or("窗口未保护。")?;
+                .ok_or(crate::locale::text("window_is_not_protected"))?;
             protection
                 .update_options(options)
                 .map_err(SharedString::from)
         });
         self.status = match result {
-            Ok(()) => "保护设置已更新。".into(),
+            Ok(()) => crate::locale::text("protection_settings_updated").into(),
             Err(error) => error,
         };
         self.rebuild_table(cx);
@@ -1433,12 +1594,15 @@ impl KeepWindow {
             return;
         }
         let result = self.options(cx).and_then(|options| {
-            let target = self.selected.clone().ok_or("请先选择窗口。")?;
+            let target = self
+                .selected
+                .clone()
+                .ok_or(crate::locale::text("select_a_window_first"))?;
             if self
                 .protection_for(&target)
                 .is_some_and(|p| p.recovery_failed)
             {
-                return Err("请先重试恢复。".into());
+                return Err(crate::locale::text("retry_restoration_first").into());
             }
             Calibration::new(target, options).map_err(SharedString::from)
         });
@@ -1453,7 +1617,7 @@ impl KeepWindow {
                     protection.set_calibration(Some(calibration.frame()));
                 }
                 self.calibration = Some(calibration);
-                self.status = "拖动遮罩移动，拖动右下角缩放；Enter 保存，Esc 取消。".into();
+                self.status = crate::locale::text("drag_to_move_the_shield_resize_from").into();
             }
             Err(error) => self.status = error,
         }
@@ -1470,7 +1634,7 @@ impl KeepWindow {
                 for protection in &mut self.protections {
                     protection.set_calibration(Some(HWND::default()));
                 }
-                self.status = "移动准星到目标窗口，单击选择；Esc 取消。".into();
+                self.status = crate::locale::text("move_the_crosshair_to_a_window_and").into();
             }
             Err(error) => self.status = error.into(),
         }
@@ -1509,14 +1673,17 @@ impl KeepWindow {
                         });
                     }
                     self.rebuild_table(cx);
-                    self.status =
-                        format!("已选择“{}”，请确认参数后开启保护。", target.display_title())
-                            .into();
+                    self.status = crate::locale::format(
+                        "selected_confirm_settings_and_enable_protection",
+                        &[("value1", &target.display_title().to_string())],
+                    )
+                    .into();
                 } else {
-                    self.status = "目标窗口已关闭，请重新选择。".into();
+                    self.status =
+                        crate::locale::text("target_window_closed_select_it_again").into();
                 }
             }
-            Ok(_) => self.status = "已取消窗口选择。".into(),
+            Ok(_) => self.status = crate::locale::text("window_selection_canceled").into(),
             Err(error) => self.status = error.into(),
         }
         self.rebuild_table(cx);
@@ -1531,7 +1698,13 @@ impl KeepWindow {
             if let Err(error) = self.store.save(&config) {
                 return Err(match crate::startup::restore(previous.as_deref()) {
                     Ok(()) => error,
-                    Err(rollback) => format!("{error}；恢复开机启动设置失败：{rollback}"),
+                    Err(rollback) => crate::locale::format(
+                        "error_could_not_restore_startup_setting_rollback",
+                        &[
+                            ("error", &error.to_string()),
+                            ("rollback", &rollback.to_string()),
+                        ],
+                    ),
                 });
             }
             self.config = config;
@@ -1539,8 +1712,10 @@ impl KeepWindow {
             Ok(())
         });
         self.status = match result {
-            Ok(()) if enabled => "已开启当前用户开机启动，登录后在后台运行。".into(),
-            Ok(()) => "已关闭开机启动。".into(),
+            Ok(()) if enabled => {
+                crate::locale::text("startup_enabled_for_the_current_user_runs").into()
+            }
+            Ok(()) => crate::locale::text("startup_disabled").into(),
             Err(error) => {
                 if let Ok(enabled) = crate::startup::enabled() {
                     self.startup_enabled = enabled;
@@ -1622,8 +1797,8 @@ impl KeepWindow {
         }
         self.status = match error {
             Some(error) => error.into(),
-            _ if saved => "遮罩校准已保存。".into(),
-            _ => "已取消校准并恢复原位置。".into(),
+            _ if saved => crate::locale::text("shield_calibration_saved").into(),
+            _ => crate::locale::text("calibration_canceled_original_position_restored").into(),
         };
         self.rebuild_table(cx);
         cx.notify();
@@ -1660,36 +1835,60 @@ impl Render for KeepWindow {
         let count = self.table.read(cx).delegate().rows.len();
         let filtering = !self.search.read(cx).value().trim().is_empty();
         let count_label = if filtering {
-            format!("{count}/{} 个窗口", self.windows.len())
+            crate::locale::format(
+                "count_windows",
+                &[
+                    ("count", &format!("{}", count)),
+                    ("value1", &format!("{}", self.windows.len())),
+                ],
+            )
         } else {
-            format!("{} 个窗口", self.windows.len())
+            crate::locale::format("windows", &[("value1", &format!("{}", self.windows.len()))])
         };
         let validation_error: Option<SharedString> =
             if editable && !self.system_menu && !self.mouse_shield {
-                Some("请选择至少一种保护方式。".into())
+                Some(crate::locale::text("select_at_least_one_protection_method").into())
             } else if parameters_enabled {
                 validation.err()
             } else {
                 None
             };
         let action_hint = match selected {
-            Some(target) if protected => {
-                format!("解除“{}”的保护。", target.display_title())
-            }
-            Some(target) => format!("将当前设置应用于“{}”。", target.display_title()),
-            None => "请先在表格中选择一个窗口。".into(),
+            Some(target) if protected => crate::locale::format(
+                "remove_protection_from",
+                &[("value1", &target.display_title().to_string())],
+            ),
+            Some(target) => crate::locale::format(
+                "apply_current_settings_to",
+                &[("value1", &target.display_title().to_string())],
+            ),
+            None => crate::locale::text("select_a_window_in_the_table_first"),
         };
         let identity_label = self
             .editing_rule
             .and_then(|index| self.config.rules.get(index))
-            .map(|rule| format!("程序：{}  ·  类名：{}", rule.path, rule.class))
+            .map(|rule| {
+                crate::locale::format(
+                    "application_class",
+                    &[
+                        ("value1", &rule.path.to_string()),
+                        ("value2", &rule.class.to_string()),
+                    ],
+                )
+            })
             .or_else(|| {
                 selected.map(|target| {
-                    format!(
-                        "程序：{}  ·  类名：{}",
-                        self.path_for(target)
-                            .unwrap_or("无法读取，请检查目标窗口权限"),
-                        target.class
+                    crate::locale::format(
+                        "application_class",
+                        &[
+                            (
+                                "value1",
+                                self.path_for(target).unwrap_or(&crate::locale::text(
+                                    "cannot_read_check_target_window_permissions",
+                                )),
+                            ),
+                            ("value2", &target.class.to_string()),
+                        ],
                     )
                 })
             });
@@ -1699,22 +1898,27 @@ impl Render for KeepWindow {
         let fields = [
             (
                 "width-field",
-                "宽",
+                crate::locale::text("w"),
                 &self.width,
-                "遮罩宽度：1–512 DIP，按目标窗口 DPI 缩放。",
+                crate::locale::text("shield_width_dip_scaled_to_the_target"),
             ),
-            ("height-field", "高", &self.height, "遮罩高度：1–512 DIP。"),
+            (
+                "height-field",
+                crate::locale::text("h"),
+                &self.height,
+                crate::locale::text("shield_height_dip"),
+            ),
             (
                 "right-field",
-                "内缩",
+                crate::locale::text("inset"),
                 &self.right_offset,
-                "右侧内缩：−512–512 DIP。正值向左，负值向右。",
+                crate::locale::text("right_inset_to_dip_positive_moves_left"),
             ),
             (
                 "top-field",
-                "下移",
+                crate::locale::text("offset"),
                 &self.top_offset,
-                "顶部下移：−512–512 DIP。正值向下，负值向上。",
+                crate::locale::text("top_offset_to_dip_positive_moves_down"),
             ),
         ]
         .into_iter()
@@ -1726,7 +1930,7 @@ impl Render for KeepWindow {
                 .items_center()
                 .gap(px(6.))
                 .h(control_height)
-                .tooltip(move |window, cx| Tooltip::new(hint).build(window, cx))
+                .tooltip(move |window, cx| Tooltip::new(hint.clone()).build(window, cx))
                 .child(div().text_sm().flex_shrink_0().child(label))
                 .child(
                     div().w(number_width).flex_shrink_0().child(
@@ -1738,44 +1942,170 @@ impl Render for KeepWindow {
                 )
         });
 
-        let toolbar = div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .flex_shrink_0()
-            .child(div().flex_1().min_w_0().max_w(px(440.)).child(
-                Input::new(&self.search)
-                    .h(px(32.))
-                    .disabled(self.picker.is_some())
-                    .prefix(Icon::new(IconName::Search).small())
-                    .cleanable(true),
-            ))
-            .child(div().flex_1())
-            .child(Button::new("hint").ghost().icon(IconName::Lightbulb).accessibility_label("保护使用提示").tooltip("标准标题栏可使用系统关闭保护；自绘标题栏可开启鼠标遮罩。关闭或最小化主界面后，保护继续运行。通过托盘返回，退出时恢复全部窗口。"))
-            .child(Button::new("refresh").ghost().icon(IconName::RefreshCw).label("刷新").tooltip("重新读取窗口列表").disabled(self.picker.is_some()).on_click(cx.listener(|this, _, _, cx| this.refresh(cx))))
-            .child(Button::new("pick-window").ghost().icon(IconName::Crosshair).label("选择窗口").tooltip("移动准星到目标窗口，单击选择；Esc 取消").disabled(self.picker.is_some() || self.calibration.is_some()).on_click(cx.listener(|this, _, _, cx| this.start_picker(cx))))
-            .child(Button::new("more").ghost().icon(IconName::Ellipsis).label("更多").disabled(self.picker.is_some()).dropdown_caret(false).dropdown_menu(move |menu, window, cx| {
-                let restore_disabled = view.read(cx).protections.is_empty();
-                menu.item(PopupMenuItem::new("恢复全部窗口").icon(IconName::RotateCcw).disabled(restore_disabled)
-                    .on_click(window.listener_for(&view, |this, _, _, cx| this.restore_all(cx))))
-                    .item(PopupMenuItem::new("应用规则管理").on_click(window.listener_for(&view, |this, _, _, cx| { this.rules_open = !this.rules_open; cx.notify(); })))
-                    .item(PopupMenuItem::new("快捷键设置").on_click(window.listener_for(&view, |this, _, _, cx| { this.hotkeys_open = !this.hotkeys_open; cx.notify(); })))
-                    .item(PopupMenuItem::new("最近事件与诊断").on_click(window.listener_for(&view, |this, _, _, cx| { this.events_open = !this.events_open; cx.notify(); })))
-                    .item(PopupMenuItem::new(format!("{}: {}", crate::locale::text("language"), crate::locale::text(if crate::locale::current() == crate::locale::Language::EnUs { "language_en" } else { "language_zh" })))
-                        .on_click(window.listener_for(&view, |this, _, _, cx| {
-                            let next = if crate::locale::current() == crate::locale::Language::EnUs { crate::locale::Language::ZhCn } else { crate::locale::Language::EnUs };
-                            this.switch_language(next, cx);
-                        })))
-                    .separator()
-                    .item(PopupMenuItem::new("仅看已保护").checked(view.read(cx).config.list.protected_only).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(0, cx))))
-                    .item(PopupMenuItem::new("按应用分组").checked(view.read(cx).config.list.grouped).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(1, cx))))
-                    .item(PopupMenuItem::new("显示辅助窗口").checked(view.read(cx).config.list.show_auxiliary).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(2, cx))))
-                    .item(PopupMenuItem::new("显示 PID 和句柄").checked(view.read(cx).config.list.advanced_columns).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(3, cx))))
-                    .item(PopupMenuItem::new("开机启动（后台运行）").checked(view.read(cx).startup_enabled).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_startup(cx))))
-                    .separator()
-                    .item(PopupMenuItem::new("退出并恢复").icon(IconName::LogOut)
-                        .on_click(window.listener_for(&view, |this, _, _, cx| this.exit(cx))))
-            }));
+        let toolbar =
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .flex_shrink_0()
+                .child(
+                    div().flex_1().min_w_0().max_w(px(440.)).child(
+                        Input::new(&self.search)
+                            .h(px(32.))
+                            .disabled(self.picker.is_some())
+                            .prefix(Icon::new(IconName::Search).small())
+                            .cleanable(true),
+                    ),
+                )
+                .child(div().flex_1())
+                .child(
+                    Button::new("hint")
+                        .ghost()
+                        .icon(IconName::Lightbulb)
+                        .accessibility_label(crate::locale::text("protection_help"))
+                        .tooltip(crate::locale::text(
+                            "use_system_protection_for_standard_title_bars",
+                        )),
+                )
+                .child(
+                    Button::new("refresh")
+                        .ghost()
+                        .icon(IconName::RefreshCw)
+                        .label(crate::locale::text("refresh_2"))
+                        .tooltip(crate::locale::text("reload_the_window_list"))
+                        .disabled(self.picker.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.refresh(cx))),
+                )
+                .child(
+                    Button::new("pick-window")
+                        .ghost()
+                        .icon(IconName::Crosshair)
+                        .label(crate::locale::text("pick_window_2"))
+                        .tooltip(crate::locale::text("move_the_crosshair_to_a_window_and_2"))
+                        .disabled(self.picker.is_some() || self.calibration.is_some())
+                        .on_click(cx.listener(|this, _, _, cx| this.start_picker(cx))),
+                )
+                .child(
+                    Button::new("more")
+                        .ghost()
+                        .icon(IconName::Ellipsis)
+                        .label(crate::locale::text("more_2"))
+                        .disabled(self.picker.is_some())
+                        .dropdown_caret(false)
+                        .dropdown_menu(move |menu, window, cx| {
+                            let restore_disabled = view.read(cx).protections.is_empty();
+                            menu.item(
+                                PopupMenuItem::new(crate::locale::text("restore_all_windows"))
+                                    .icon(IconName::RotateCcw)
+                                    .disabled(restore_disabled)
+                                    .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                        this.restore_all(cx)
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("rule_manager")).on_click(
+                                    window.listener_for(&view, |this, _, _, cx| {
+                                        this.rules_open = !this.rules_open;
+                                        cx.notify();
+                                    }),
+                                ),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("hotkey_settings"))
+                                    .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                        this.hotkeys_open = !this.hotkeys_open;
+                                        cx.notify();
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text(
+                                    "recent_events_and_diagnostics",
+                                ))
+                                .on_click(window.listener_for(
+                                    &view,
+                                    |this, _, _, cx| {
+                                        this.events_open = !this.events_open;
+                                        cx.notify();
+                                    },
+                                )),
+                            )
+                            .item(
+                                PopupMenuItem::new(format!(
+                                    "{}: {}",
+                                    crate::locale::text("language"),
+                                    crate::locale::text(
+                                        if crate::locale::current() == crate::locale::Language::EnUs
+                                        {
+                                            "language_en"
+                                        } else {
+                                            "language_zh"
+                                        }
+                                    )
+                                ))
+                                .on_click(window.listener_for(
+                                    &view,
+                                    |this, _, window, cx| {
+                                        let next = if crate::locale::current()
+                                            == crate::locale::Language::EnUs
+                                        {
+                                            crate::locale::Language::ZhCn
+                                        } else {
+                                            crate::locale::Language::EnUs
+                                        };
+                                        this.switch_language(next, window, cx);
+                                    },
+                                )),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("protected_only_2"))
+                                    .checked(view.read(cx).config.list.protected_only)
+                                    .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                        this.toggle_list(0, cx)
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("group_by_application"))
+                                    .checked(view.read(cx).config.list.grouped)
+                                    .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                        this.toggle_list(1, cx)
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("show_auxiliary_windows"))
+                                    .checked(view.read(cx).config.list.show_auxiliary)
+                                    .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                        this.toggle_list(2, cx)
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("show_pid_and_handle"))
+                                    .checked(view.read(cx).config.list.advanced_columns)
+                                    .on_click(window.listener_for(&view, |this, _, _, cx| {
+                                        this.toggle_list(3, cx)
+                                    })),
+                            )
+                            .item(
+                                PopupMenuItem::new(crate::locale::text(
+                                    "start_with_windows_background",
+                                ))
+                                .checked(view.read(cx).startup_enabled)
+                                .on_click(
+                                    window.listener_for(&view, |this, _, _, cx| {
+                                        this.toggle_startup(cx)
+                                    }),
+                                ),
+                            )
+                            .separator()
+                            .item(
+                                PopupMenuItem::new(crate::locale::text("exit_and_restore"))
+                                    .icon(IconName::LogOut)
+                                    .on_click(
+                                        window.listener_for(&view, |this, _, _, cx| this.exit(cx)),
+                                    ),
+                            )
+                        }),
+                );
 
         let config = div()
             .v_flex()
@@ -1787,73 +2117,407 @@ impl Render for KeepWindow {
             .border_color(theme.border)
             .bg(theme.table)
             .child(
-                div().flex().items_center().gap_2()
-                    .child(div().flex().items_center().gap_4().flex_shrink_0()
-                        .child(Checkbox::new("system-menu").small().h(control_height).items_center().label("系统保护").checked(self.system_menu).disabled(!editable)
-                            .tooltip("禁用标准标题栏和系统菜单的关闭命令。修改后点击“应用”。")
-                            .on_change(cx.listener(|this, value, _, cx| { this.system_menu = *value; cx.notify(); })))
-                        .child(Checkbox::new("mouse-shield").small().h(control_height).items_center().label("鼠标遮罩").checked(self.mouse_shield).disabled(!editable)
-                            .tooltip("拦截遮罩区域内的鼠标点击，可用“校准”调整位置。修改后点击“应用”。")
-                            .on_change(cx.listener(|this, value, _, cx| { this.mouse_shield = *value; cx.notify(); }))))
-                    .when_some(identity_label, |row, label| row.child(Button::new("target-identity").ghost().small().h(control_height).icon(IconName::Info).accessibility_label("目标窗口信息").tooltip(label)))
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .flex_shrink_0()
+                            .child(
+                                Checkbox::new("system-menu")
+                                    .small()
+                                    .h(control_height)
+                                    .items_center()
+                                    .label(crate::locale::text("system_protection_2"))
+                                    .checked(self.system_menu)
+                                    .disabled(!editable)
+                                    .tooltip(crate::locale::text(
+                                        "disable_the_close_command_on_standard_title",
+                                    ))
+                                    .on_change(cx.listener(|this, value, _, cx| {
+                                        this.system_menu = *value;
+                                        cx.notify();
+                                    })),
+                            )
+                            .child(
+                                Checkbox::new("mouse-shield")
+                                    .small()
+                                    .h(control_height)
+                                    .items_center()
+                                    .label(crate::locale::text("mouse_shield_2"))
+                                    .checked(self.mouse_shield)
+                                    .disabled(!editable)
+                                    .tooltip(crate::locale::text(
+                                        "intercept_clicks_inside_the_shield_use_calibrate",
+                                    ))
+                                    .on_change(cx.listener(|this, value, _, cx| {
+                                        this.mouse_shield = *value;
+                                        cx.notify();
+                                    })),
+                            ),
+                    )
+                    .when_some(identity_label, |row, label| {
+                        row.child(
+                            Button::new("target-identity")
+                                .ghost()
+                                .small()
+                                .h(control_height)
+                                .icon(IconName::Info)
+                                .accessibility_label(crate::locale::text(
+                                    "target_window_information",
+                                ))
+                                .tooltip(label),
+                        )
+                    })
                     .child(div().flex_1())
-                    .child(Button::new("rule-settings").ghost().small().h(control_height).label("规则").icon(if self.rule_settings_open { IconName::ChevronUp } else { IconName::ChevronDown })
-                        .tooltip(if self.rule_settings_open { "收起规则设置" } else { "展开标题匹配、自动保护和保存规则" }).disabled(!editable && !self.rule_settings_open)
-                        .on_click(cx.listener(|this, _, _, cx| { this.rule_settings_open = !this.rule_settings_open; cx.notify(); })))
-                    .when(protected, |row| row.child(Button::new("apply").small().h(control_height).label("应用").tooltip("将修改后的设置应用到当前窗口").disabled(!can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx)))))
-                    .when(protected, |row| row.child(Button::new("release-ten").small().label("放行 10 秒").disabled(!editable || recovery_failed).on_click(cx.listener(|this, _, _, cx| { if let Some(target) = this.selected.clone() { this.release_target(target, cx); } }))))
-                    .when(selected.is_some_and(|target| self.attempts.iter().any(|attempt| attempt.target.same_identity(target))), |row| row.child(Button::new("retry").small().label("重试").disabled(!editable).on_click(cx.listener(|this, _, _, cx| this.retry_selected(cx)))))
-                    .child(Button::new("toggle-protection").primary().small().h(control_height).flex_shrink_0()
-                        .icon(if protected { IconName::RotateCcw } else { IconName::ShieldCheck })
-                        .label(if recovery_failed { "重试恢复" } else if protected { "解除保护" } else { "开启保护" })
-                        .tooltip(action_hint).disabled(self.calibration.is_some() || self.picker.is_some() || (!protected && !can_protect))
-                        .on_click(cx.listener(|this, _, _, cx| {
-                            let protected = this.selected.as_ref().is_some_and(|target| this.protection_for(target).is_some());
-                            if protected { this.restore_selected(cx); } else { this.protect(cx); }
-                        })))
+                    .child(
+                        Button::new("rule-settings")
+                            .ghost()
+                            .small()
+                            .h(control_height)
+                            .label(crate::locale::text("rules_2"))
+                            .icon(if self.rule_settings_open {
+                                IconName::ChevronUp
+                            } else {
+                                IconName::ChevronDown
+                            })
+                            .tooltip(if self.rule_settings_open {
+                                crate::locale::text("collapse_rule_settings")
+                            } else {
+                                crate::locale::text(
+                                    "expand_title_matching_automatic_protection_and_rule",
+                                )
+                            })
+                            .disabled(!editable && !self.rule_settings_open)
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.rule_settings_open = !this.rule_settings_open;
+                                cx.notify();
+                            })),
+                    )
+                    .when(protected, |row| {
+                        row.child(
+                            Button::new("apply")
+                                .small()
+                                .h(control_height)
+                                .label(crate::locale::text("apply_2"))
+                                .tooltip(crate::locale::text(
+                                    "apply_edited_settings_to_the_current_window",
+                                ))
+                                .disabled(!can_protect || recovery_failed)
+                                .on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx))),
+                        )
+                    })
+                    .when(protected, |row| {
+                        row.child(
+                            Button::new("release-ten")
+                                .small()
+                                .label(crate::locale::text("release_for_seconds"))
+                                .disabled(!editable || recovery_failed)
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(target) = this.selected.clone() {
+                                        this.release_target(target, cx);
+                                    }
+                                })),
+                        )
+                    })
+                    .when(
+                        selected.is_some_and(|target| {
+                            self.attempts
+                                .iter()
+                                .any(|attempt| attempt.target.same_identity(target))
+                        }),
+                        |row| {
+                            row.child(
+                                Button::new("retry")
+                                    .small()
+                                    .label(crate::locale::text("retry_2"))
+                                    .disabled(!editable)
+                                    .on_click(
+                                        cx.listener(|this, _, _, cx| this.retry_selected(cx)),
+                                    ),
+                            )
+                        },
+                    )
+                    .child(
+                        Button::new("toggle-protection")
+                            .primary()
+                            .small()
+                            .h(control_height)
+                            .flex_shrink_0()
+                            .icon(if protected {
+                                IconName::RotateCcw
+                            } else {
+                                IconName::ShieldCheck
+                            })
+                            .label(if recovery_failed {
+                                crate::locale::text("retry_restoration")
+                            } else if protected {
+                                crate::locale::text("remove_protection")
+                            } else {
+                                crate::locale::text("enable_protection")
+                            })
+                            .tooltip(action_hint)
+                            .disabled(
+                                self.calibration.is_some()
+                                    || self.picker.is_some()
+                                    || (!protected && !can_protect),
+                            )
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                let protected = this
+                                    .selected
+                                    .as_ref()
+                                    .is_some_and(|target| this.protection_for(target).is_some());
+                                if protected {
+                                    this.restore_selected(cx);
+                                } else {
+                                    this.protect(cx);
+                                }
+                            })),
+                    ),
             )
-            .when(self.mouse_shield, |config| config.child(
-                div().flex().flex_wrap().items_center().gap_x_3().gap_y_2().children(fields)
-                    .child(div().flex().items_center().gap_3().flex_shrink_0()
-                        .child(div().id("opacity-field").flex().items_center().gap(px(6.)).h(control_height)
-                            .tooltip(|window, cx| Tooltip::new("遮罩透明度：5–80%。数值越小，遮罩越透明。").build(window, cx))
-                            .child(div().text_sm().child("透明度"))
-                            .child(div().w(number_width).flex_shrink_0().child(NumberInput::new(&self.opacity).small().h(control_height).disabled(!parameters_enabled))))
-                        .child(Button::new("calibrate").small().h(control_height).label("校准").tooltip("拖动遮罩调整位置和大小；Enter 保存，Esc 取消")
-                            .disabled(!can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.start_calibration(cx)))))
-            ))
-            .when(self.rule_settings_open, |config| config.child(div().flex().items_center().gap_3().pt_3().border_t_1().border_color(theme.border)
-                .child(div().w(px(140.)).child(Input::new(&self.rule_name).small()))
-                .child(div().id("title-match-help").flex_1().min_w_0()
-                    .tooltip(|window, cx| Tooltip::new("规则按程序路径和窗口类名匹配。标题关键词留空时匹配所有同类窗口。").build(window, cx))
-                    .child(Input::new(&self.title_contains).small().h(control_height).aria_label("规则标题关键词").disabled(!editable)))
-                .child(Checkbox::new("automatic").small().h(control_height).items_center().label("自动保护").checked(self.automatic).disabled(!editable)
-                    .tooltip("保存后，自动保护匹配规则的新窗口")
-                    .on_change(cx.listener(|this, checked, _, cx| { this.automatic = *checked; cx.notify(); })))
-                .child(Button::new("save-rule").small().h(control_height).label("保存规则").tooltip("保存程序、窗口类名、标题条件和当前保护参数")
-                    .disabled(!editable || validation_error.is_some() || self.editing_rule.is_none() && selected.is_none_or(|target| self.path_for(target).is_none()))
-                    .on_click(cx.listener(|this, _, _, cx| this.save_rule(cx))))))
-            .when(self.rule_settings_open && self.editing_rule.is_some(), |config| config.child(Button::new("save-as-new").small().label("另存为新规则（修改标题条件后）").on_click(cx.listener(|this, _, _, cx| { this.editing_rule = None; this.save_rule(cx); }))))
-            .when_some(selected.map(|target| {
-                let mut detail = format!("{} · PID {} · 0x{:X}", target.display_title(), target.pid, target.hwnd.0 as usize);
-                if let Some(protection) = self.protection_for(target) {
-                    detail.push_str(&format!("\n{}", protection.status().description()));
-                    if protection.options.mouse_shield {
-                        detail.push_str(if protection.calibrating { " · 拦截暂停" } else if window::foreground_matches(target.hwnd) { " · 前台拦截" } else { " · 后台待命" });
-                        if !self.confirmed.iter().any(|item| item.same_identity(target)) { detail.push_str(" · 位置待确认，请校准或确认覆盖位置"); }
+            .when(self.mouse_shield, |config| {
+                config.child(
+                    div()
+                        .flex()
+                        .flex_wrap()
+                        .items_center()
+                        .gap_x_3()
+                        .gap_y_2()
+                        .children(fields)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .flex_shrink_0()
+                                .child(
+                                    div()
+                                        .id("opacity-field")
+                                        .flex()
+                                        .items_center()
+                                        .gap(px(6.))
+                                        .h(control_height)
+                                        .tooltip(|window, cx| {
+                                            Tooltip::new(crate::locale::text(
+                                                "shield_opacity_lower_values_make_the_shield",
+                                            ))
+                                            .build(window, cx)
+                                        })
+                                        .child(
+                                            div().text_sm().child(crate::locale::text("opacity")),
+                                        )
+                                        .child(
+                                            div().w(number_width).flex_shrink_0().child(
+                                                NumberInput::new(&self.opacity)
+                                                    .small()
+                                                    .h(control_height)
+                                                    .disabled(!parameters_enabled),
+                                            ),
+                                        ),
+                                )
+                                .child(
+                                    Button::new("calibrate")
+                                        .small()
+                                        .h(control_height)
+                                        .label(crate::locale::text("calibrate_2"))
+                                        .tooltip(crate::locale::text(
+                                            "drag_to_adjust_shield_position_and_size",
+                                        ))
+                                        .disabled(!can_protect || recovery_failed)
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| {
+                                                this.start_calibration(cx)
+                                            }),
+                                        ),
+                                ),
+                        ),
+                )
+            })
+            .when(self.rule_settings_open, |config| {
+                config.child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .pt_3()
+                        .border_t_1()
+                        .border_color(theme.border)
+                        .child(div().w(px(140.)).child(Input::new(&self.rule_name).small()))
+                        .child(
+                            div()
+                                .id("title-match-help")
+                                .flex_1()
+                                .min_w_0()
+                                .tooltip(|window, cx| {
+                                    Tooltip::new(crate::locale::text(
+                                        "rules_match_application_path_and_window_class",
+                                    ))
+                                    .build(window, cx)
+                                })
+                                .child(
+                                    Input::new(&self.title_contains)
+                                        .small()
+                                        .h(control_height)
+                                        .aria_label(crate::locale::text("rule_title_keyword"))
+                                        .disabled(!editable),
+                                ),
+                        )
+                        .child(
+                            Checkbox::new("automatic")
+                                .small()
+                                .h(control_height)
+                                .items_center()
+                                .label(crate::locale::text("automatic_protection"))
+                                .checked(self.automatic)
+                                .disabled(!editable)
+                                .tooltip(crate::locale::text(
+                                    "automatically_protect_new_matching_windows_after_saving",
+                                ))
+                                .on_change(cx.listener(|this, checked, _, cx| {
+                                    this.automatic = *checked;
+                                    cx.notify();
+                                })),
+                        )
+                        .child(
+                            Button::new("save-rule")
+                                .small()
+                                .h(control_height)
+                                .label(crate::locale::text("save_rule_2"))
+                                .tooltip(crate::locale::text(
+                                    "save_application_window_class_title_condition_and",
+                                ))
+                                .disabled(
+                                    !editable
+                                        || validation_error.is_some()
+                                        || self.editing_rule.is_none()
+                                            && selected.is_none_or(|target| {
+                                                self.path_for(target).is_none()
+                                            }),
+                                )
+                                .on_click(cx.listener(|this, _, _, cx| this.save_rule(cx))),
+                        ),
+                )
+            })
+            .when(
+                self.rule_settings_open && self.editing_rule.is_some(),
+                |config| {
+                    config.child(
+                        Button::new("save-as-new")
+                            .small()
+                            .label(crate::locale::text(
+                                "save_as_new_rule_change_title_condition",
+                            ))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.editing_rule = None;
+                                this.save_rule(cx);
+                            })),
+                    )
+                },
+            )
+            .when_some(
+                selected.map(|target| {
+                    let mut detail = format!(
+                        "{} · PID {} · 0x{:X}",
+                        target.display_title(),
+                        target.pid,
+                        target.hwnd.0 as usize
+                    );
+                    if let Some(protection) = self.protection_for(target) {
+                        detail.push_str(&format!("\n{}", protection.status().description()));
+                        if protection.options.mouse_shield {
+                            detail.push_str(&if protection.calibrating {
+                                crate::locale::text("interception_paused")
+                            } else if window::foreground_matches(target.hwnd) {
+                                crate::locale::text("intercepting_in_foreground")
+                            } else {
+                                crate::locale::text("standing_by_in_background")
+                            });
+                            if !self.confirmed.iter().any(|item| item.same_identity(target)) {
+                                detail.push_str(&crate::locale::text(
+                                    "position_unconfirmed_calibrate_or_confirm_coverage",
+                                ));
+                            }
+                        }
+                        if self
+                            .options(cx)
+                            .is_ok_and(|options| options != protection.options)
+                        {
+                            detail.push_str(&crate::locale::text("unapplied_changes"));
+                        }
                     }
-                    if self.options(cx).is_ok_and(|options| options != protection.options) { detail.push_str(" · 有未应用修改"); }
-                }
-                let matches: Vec<_> = self.path_for(target).map(|path| self.config.rules.iter().enumerate().filter(|(_, rule)| rule.matches(path, target)).map(|(index, rule)| format!("{}:{}", index + 1, if rule.name.is_empty() { &rule.class } else { &rule.name })).collect()).unwrap_or_default();
-                if !matches.is_empty() {
-                    detail.push_str(&format!("\n匹配规则：{}。带标题条件优先，同类按列表顺序；规则修改仅影响后续匹配。", matches.join("、")));
-                    if let Some((index, _)) = self.path_for(target).and_then(|path| self.config.matching_rule(path, target, false)) { detail.push_str(&format!(" 当前采用第 {} 条。", index + 1)); }
-                }
-                detail
-            }), |config, detail| config.child(div().text_xs().child(detail)))
-            .when(protected && self.mouse_shield, |config| config.child(div().flex().gap_2().items_center().child(div().text_xs().flex_1().child("鼠标遮罩仅拦截覆盖区域；程序退出命令、直接关闭消息和结束进程仍可关闭窗口。" )).child(Button::new("confirm-position").small().label("已确认位置").on_click(cx.listener(|this, _, _, cx| { if let Some(target) = this.selected.clone() { this.confirmed.push(target); } cx.notify(); })))))
-            .when_some(self.config_error.clone(), |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)))
-            .when_some(validation_error, |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)));
+                    let matches: Vec<_> = self
+                        .path_for(target)
+                        .map(|path| {
+                            self.config
+                                .rules
+                                .iter()
+                                .enumerate()
+                                .filter(|(_, rule)| rule.matches(path, target))
+                                .map(|(index, rule)| {
+                                    format!(
+                                        "{}:{}",
+                                        index + 1,
+                                        if rule.name.is_empty() {
+                                            &rule.class
+                                        } else {
+                                            &rule.name
+                                        }
+                                    )
+                                })
+                                .collect()
+                        })
+                        .unwrap_or_default();
+                    if !matches.is_empty() {
+                        detail.push_str(&crate::locale::format(
+                            "matching_rules_title_conditions_take_priority_then",
+                            &[("value1", &matches.join("、").to_string())],
+                        ));
+                        if let Some((index, _)) = self
+                            .path_for(target)
+                            .and_then(|path| self.config.matching_rule(path, target, false))
+                        {
+                            detail.push_str(&crate::locale::format(
+                                "currently_using_rule",
+                                &[("value1", &format!("{}", index + 1))],
+                            ));
+                        }
+                    }
+                    detail
+                }),
+                |config, detail| config.child(div().text_xs().child(detail)),
+            )
+            .when(protected && self.mouse_shield, |config| {
+                config.child(
+                    div()
+                        .flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().text_xs().flex_1().child(crate::locale::text(
+                            "the_shield_only_intercepts_clicks_in_its",
+                        )))
+                        .child(
+                            Button::new("confirm-position")
+                                .small()
+                                .label(crate::locale::text("confirm_position"))
+                                .on_click(cx.listener(|this, _, _, cx| {
+                                    if let Some(target) = this.selected.clone() {
+                                        this.confirmed.push(target);
+                                    }
+                                    cx.notify();
+                                })),
+                        ),
+                )
+            })
+            .when_some(self.config_error.clone(), |config, error| {
+                config.child(div().text_xs().text_color(theme.danger).child(error))
+            })
+            .when_some(validation_error, |config, error| {
+                config.child(div().text_xs().text_color(theme.danger).child(error))
+            });
 
         let rules = div()
             .id("rule-list")
@@ -1866,16 +2530,16 @@ impl Render for KeepWindow {
                 let label = format!(
                     "{} · {} · {} · {}",
                     if rule.name.is_empty() {
-                        "未命名"
+                        crate::locale::text("unnamed_2")
                     } else {
-                        &rule.name
+                        rule.name.clone()
                     },
                     rule.path.rsplit('\\').next().unwrap_or(&rule.path),
                     rule.class,
                     if rule.title_contains.is_empty() {
-                        "所有同类窗口"
+                        crate::locale::text("all_windows_of_this_class")
                     } else {
-                        &rule.title_contains
+                        rule.title_contains.clone()
                     }
                 );
                 div()
@@ -1886,7 +2550,7 @@ impl Render for KeepWindow {
                     .child(
                         Button::new(("move-up", index))
                             .small()
-                            .label("上移")
+                            .label(crate::locale::text("move_up"))
                             .disabled(index == 0)
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let mut config = this.config.clone();
@@ -1899,7 +2563,7 @@ impl Render for KeepWindow {
                     .child(
                         Button::new(("move-down", index))
                             .small()
-                            .label("下移")
+                            .label(crate::locale::text("move_down"))
                             .disabled(index + 1 == self.config.rules.len())
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let mut config = this.config.clone();
@@ -1912,7 +2576,7 @@ impl Render for KeepWindow {
                     .child(
                         Button::new(("edit-rule", index))
                             .small()
-                            .label("编辑")
+                            .label(crate::locale::text("edit"))
                             .on_click(cx.listener(move |this, _, window, cx| {
                                 this.edit_rule(index, window, cx)
                             })),
@@ -1921,9 +2585,9 @@ impl Render for KeepWindow {
                         Button::new(("disable-rule", index))
                             .small()
                             .label(if rule.automatic {
-                                "禁用自动"
+                                crate::locale::text("disable_automatic")
                             } else {
-                                "启用自动"
+                                crate::locale::text("enable_automatic")
                             })
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let mut config = this.config.clone();
@@ -1935,7 +2599,7 @@ impl Render for KeepWindow {
                     .child(
                         Button::new(("delete-rule", index))
                             .small()
-                            .label("删除")
+                            .label(crate::locale::text("delete"))
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let mut config = this.config.clone();
                                 config.rules.remove(index);
@@ -1950,7 +2614,11 @@ impl Render for KeepWindow {
                     )
             }))
             .when(self.config.rules.is_empty(), |list| {
-                list.child(div().text_sm().child("暂无规则，选中窗口后保存应用规则。"))
+                list.child(
+                    div()
+                        .text_sm()
+                        .child(crate::locale::text("no_rules_yet_select_a_window_and")),
+                )
             });
         let table = div()
             .flex_1()
@@ -1981,16 +2649,225 @@ impl Render for KeepWindow {
                     .gap_3()
                     .p_4()
                     .child(toolbar)
-                    .when(self.hotkeys_open, |container| container.child(div().v_flex().gap_2().children(self.hotkey_inputs.iter().enumerate().map(|(index, input)| div().flex().items_center().gap_2().child(div().w(px(180.)).text_sm().child(["切换前台窗口保护", "临时放行前台窗口 10 秒", "解除全部保护"][index])).child(div().flex_1().child(Input::new(input).small())))).child(Button::new("save-hotkeys").small().label("保存快捷键").on_click(cx.listener(|this, _, _, cx| this.save_hotkeys(cx))))))
-                    .when(self.events_open, |container| container.child(div().v_flex().gap_2().child(div().flex().gap_2().child(Checkbox::new("private-diagnostic").label("诊断包含标题、路径与完整错误").checked(self.include_private).on_change(cx.listener(|this, value, _, cx| { this.include_private = *value; cx.notify(); }))).child(Button::new("copy-diagnostic").small().label("复制诊断").on_click(cx.listener(|this, _, _, cx| { cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(this.diagnostic())); this.status = "诊断信息已复制。".into(); }))).child(Button::new("open-logs").small().label("打开日志目录").on_click(cx.listener(|this, _, _, _| { if let Some(path) = crate::events::directory() { match std::fs::create_dir_all(&path).and_then(|()| std::process::Command::new("explorer.exe").arg(path).spawn().map(|_| ())) { Ok(()) => {}, Err(error) => this.status = error.to_string().into() } } })))).child(div().id("events-list").h(px(120.)).overflow_y_scroll().children(self.events.entries.iter().rev().map(|event| div().text_xs().child(format!("{} [{}] {} ×{}", event.time, event.source, event.detail, event.count))))).when_some(self.events.error.clone(), |panel, error| panel.child(div().text_xs().child(format!("日志写入失败：{error}"))))))
-                    .when(self.rules_open, |container| container.child(div().v_flex().gap_2().child(div().text_xs().child("优先级：带标题条件优先，同类按列表顺序。修改规则不会更改已保护窗口。" )).child(div().flex().gap_2().child(div().flex_1().child(Input::new(&self.transfer_path).small())).child(Button::new("export-rules").small().label("导出").on_click(cx.listener(|this, _, _, cx| this.transfer_rules(false, cx)))).child(Button::new("import-rules").small().label("预览导入").on_click(cx.listener(|this, _, _, cx| this.transfer_rules(true, cx))))).when(self.imported.is_some(), |panel| panel.child(div().flex().gap_2().child(Button::new("keep-existing").small().label("导入：保留已有").on_click(cx.listener(|this, _, _, cx| this.confirm_import(false, cx)))).child(Button::new("overwrite-existing").small().label("导入：覆盖冲突").on_click(cx.listener(|this, _, _, cx| this.confirm_import(true, cx)))).child(Button::new("cancel-import").small().label("取消").on_click(cx.listener(|this, _, _, cx| { this.imported = None; cx.notify(); }))))).when(self.undo_rules.is_some(), |panel| panel.child(Button::new("undo-delete").small().label("撤销删除").on_click(cx.listener(|this, _, _, cx| { if let Some(rules) = this.undo_rules.take() { let mut config = this.config.clone(); config.rules = rules; this.commit_config(config); this.editing_rule = None; } cx.notify(); }))))))
+                    .when(self.hotkeys_open, |container| {
+                        container.child(
+                            div()
+                                .v_flex()
+                                .gap_2()
+                                .children(self.hotkey_inputs.iter().enumerate().map(
+                                    |(index, input)| {
+                                        div()
+                                            .flex()
+                                            .items_center()
+                                            .gap_2()
+                                            .child(
+                                                div().w(px(180.)).text_sm().child(
+                                                    [
+                                                        crate::locale::text(
+                                                            "toggle_foreground_window_protection",
+                                                        ),
+                                                        crate::locale::text(
+                                                            "release_foreground_window_for_seconds",
+                                                        ),
+                                                        crate::locale::text(
+                                                            "remove_all_protection",
+                                                        ),
+                                                    ][index]
+                                                        .clone(),
+                                                ),
+                                            )
+                                            .child(div().flex_1().child(Input::new(input).small()))
+                                    },
+                                ))
+                                .child(
+                                    Button::new("save-hotkeys")
+                                        .small()
+                                        .label(crate::locale::text("save_hotkeys"))
+                                        .on_click(
+                                            cx.listener(|this, _, _, cx| this.save_hotkeys(cx)),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(self.events_open, |container| {
+                        container.child(
+                            div()
+                                .v_flex()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            Checkbox::new("private-diagnostic")
+                                                .label(crate::locale::text(
+                                                    "include_titles_paths_and_full_errors_in",
+                                                ))
+                                                .checked(self.include_private)
+                                                .on_change(cx.listener(|this, value, _, cx| {
+                                                    this.include_private = *value;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("copy-diagnostic")
+                                                .small()
+                                                .label(crate::locale::text("copy_diagnostics"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    cx.write_to_clipboard(
+                                                        gpui_kit::ClipboardItem::new_string(
+                                                            this.diagnostic(),
+                                                        ),
+                                                    );
+                                                    this.status =
+                                                        crate::locale::text("diagnostics_copied")
+                                                            .into();
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("open-logs")
+                                                .small()
+                                                .label(crate::locale::text("open_log_folder"))
+                                                .on_click(cx.listener(|this, _, _, _| {
+                                                    if let Some(path) = crate::events::directory() {
+                                                        match std::fs::create_dir_all(&path)
+                                                            .and_then(|()| {
+                                                                std::process::Command::new(
+                                                                    "explorer.exe",
+                                                                )
+                                                                .arg(path)
+                                                                .spawn()
+                                                                .map(|_| ())
+                                                            }) {
+                                                            Ok(()) => {}
+                                                            Err(error) => {
+                                                                this.status =
+                                                                    error.to_string().into()
+                                                            }
+                                                        }
+                                                    }
+                                                })),
+                                        ),
+                                )
+                                .child(
+                                    div()
+                                        .id("events-list")
+                                        .h(px(120.))
+                                        .overflow_y_scroll()
+                                        .children(self.events.entries.iter().rev().map(|event| {
+                                            div().text_xs().child(format!(
+                                                "{} [{}] {} ×{}",
+                                                event.time, event.source, event.detail, event.count
+                                            ))
+                                        })),
+                                )
+                                .when_some(self.events.error.clone(), |panel, error| {
+                                    panel.child(div().text_xs().child(crate::locale::format(
+                                        "log_write_failed_error",
+                                        &[("error", &error.to_string())],
+                                    )))
+                                }),
+                        )
+                    })
+                    .when(self.rules_open, |container| {
+                        container.child(
+                            div()
+                                .v_flex()
+                                .gap_2()
+                                .child(div().text_xs().child(crate::locale::text(
+                                    "priority_title_conditions_first_then_list_order",
+                                )))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .gap_2()
+                                        .child(
+                                            div()
+                                                .flex_1()
+                                                .child(Input::new(&self.transfer_path).small()),
+                                        )
+                                        .child(
+                                            Button::new("export-rules")
+                                                .small()
+                                                .label(crate::locale::text("export_2"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.transfer_rules(false, cx)
+                                                })),
+                                        )
+                                        .child(
+                                            Button::new("import-rules")
+                                                .small()
+                                                .label(crate::locale::text("preview_import"))
+                                                .on_click(cx.listener(|this, _, _, cx| {
+                                                    this.transfer_rules(true, cx)
+                                                })),
+                                        ),
+                                )
+                                .when(self.imported.is_some(), |panel| {
+                                    panel.child(
+                                        div()
+                                            .flex()
+                                            .gap_2()
+                                            .child(
+                                                Button::new("keep-existing")
+                                                    .small()
+                                                    .label(crate::locale::text(
+                                                        "import_keep_existing",
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.confirm_import(false, cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("overwrite-existing")
+                                                    .small()
+                                                    .label(crate::locale::text(
+                                                        "import_overwrite_conflicts",
+                                                    ))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.confirm_import(true, cx)
+                                                    })),
+                                            )
+                                            .child(
+                                                Button::new("cancel-import")
+                                                    .small()
+                                                    .label(crate::locale::text("cancel"))
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.imported = None;
+                                                        cx.notify();
+                                                    })),
+                                            ),
+                                    )
+                                })
+                                .when(self.undo_rules.is_some(), |panel| {
+                                    panel.child(
+                                        Button::new("undo-delete")
+                                            .small()
+                                            .label(crate::locale::text("undo_deletion"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                if let Some(rules) = this.undo_rules.take() {
+                                                    let mut config = this.config.clone();
+                                                    config.rules = rules;
+                                                    this.commit_config(config);
+                                                    this.editing_rule = None;
+                                                }
+                                                cx.notify();
+                                            })),
+                                    )
+                                }),
+                        )
+                    })
                     .child(if self.rules_open {
                         div()
                             .flex_1()
                             .min_h(px(110.))
                             .v_flex()
                             .gap_2()
-                            .child(div().text_sm().child("应用规则"))
+                            .child(
+                                div()
+                                    .text_sm()
+                                    .child(crate::locale::text("application_rules")),
+                            )
                             .child(rules)
                             .into_any_element()
                     } else {
@@ -2011,11 +2888,13 @@ impl Render for KeepWindow {
                     .bg(theme.table)
                     .text_xs()
                     .text_color(theme.muted_foreground)
-                    .child(
-                        div()
-                            .flex_shrink_0()
-                            .child(format!("{count_label} · {} 个保护", self.protections.len())),
-                    )
+                    .child(div().flex_shrink_0().child(crate::locale::format(
+                        "count_label_protected",
+                        &[
+                            ("count_label", &count_label.to_string()),
+                            ("value1", &format!("{}", self.protections.len())),
+                        ],
+                    )))
                     .child(
                         div()
                             .id("operation-status")
@@ -2034,6 +2913,8 @@ impl Render for KeepWindow {
 }
 
 pub fn run() {
+    let (_, config, _) = Store::load();
+    crate::locale::set(crate::locale::from_config(config.language.as_deref()));
     let background = std::env::args().any(|arg| arg == "--background");
     let _instance = match crate::instance::Instance::acquire(background) {
         Ok(Some(instance)) => instance,
@@ -2050,7 +2931,13 @@ pub fn run() {
             gpui_kit::init(cx);
             ui::init_theme(cx);
             if let Err(error) = crate::protection::register_overlay_class() {
-                report_startup_error(background, &format!("无法注册鼠标遮罩：{error}"));
+                report_startup_error(
+                    background,
+                    &crate::locale::format(
+                        "cannot_register_mouse_shield_error",
+                        &[("error", &format!("{}", error))],
+                    ),
+                );
                 cx.quit();
                 return;
             }
@@ -2073,7 +2960,10 @@ pub fn run() {
                 Err(error) => {
                     report_startup_error(
                         background,
-                        &format!("无法创建 KeepWindow 主窗口：{error}"),
+                        &crate::locale::format(
+                            "cannot_create_keepwindow_main_window_error",
+                            &[("error", &format!("{}", error))],
+                        ),
                     );
                     cx.quit();
                     return;

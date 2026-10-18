@@ -13,6 +13,19 @@ fn main() {
         en_keys.keys().collect::<Vec<_>>(),
         "locale keys differ"
     );
+    for (key, value) in zh_keys {
+        let placeholders = |text: &str| -> std::collections::BTreeSet<String> {
+            text.split('{')
+                .skip(1)
+                .filter_map(|part| part.split_once('}').map(|(name, _)| name.to_string()))
+                .collect()
+        };
+        assert_eq!(
+            placeholders(value.as_str().expect("locale value must be text")),
+            placeholders(en_keys[key].as_str().expect("locale value must be text")),
+            "placeholder mismatch: {key}"
+        );
+    }
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         winresource::WindowsResource::new()
             .set_icon("assets/keep-window.ico")

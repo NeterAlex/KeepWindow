@@ -27,18 +27,25 @@ pub fn parse(text: &str) -> Result<Option<(u32, u32)>, String> {
                 {
                     0x70 + number - 1
                 } else {
-                    return Err("快捷键格式：Ctrl+Alt+K 或 Ctrl+Shift+F8。".into());
+                    return Err(crate::locale::text("hotkey_format_ctrl_alt_k_or_ctrl"));
                 };
                 if key.replace(value).is_some() {
-                    return Err("每个快捷键只能包含一个主键。".into());
+                    return Err(crate::locale::text(
+                        "each_hotkey_must_contain_exactly_one_main",
+                    ));
                 }
             }
         }
     }
     if modifiers == 0 {
-        return Err("快捷键至少包含 Ctrl、Alt、Shift 或 Win。".into());
+        return Err(crate::locale::text(
+            "hotkeys_must_include_ctrl_alt_shift_or",
+        ));
     }
-    Ok(Some((modifiers, key.ok_or("快捷键缺少主键。")?)))
+    Ok(Some((
+        modifiers,
+        key.ok_or(crate::locale::text("hotkey_is_missing_its_main_key"))?,
+    )))
 }
 
 pub struct Hotkeys {
@@ -62,7 +69,7 @@ impl Hotkeys {
             .collect::<Result<_, _>>()?;
         for (index, value) in parsed.iter().enumerate() {
             if value.is_some() && parsed[..index].contains(value) {
-                return Err("多个动作不能使用同一个快捷键。".into());
+                return Err(crate::locale::text("actions_cannot_share_the_same_hotkey"));
             }
         }
         let base = if self.generation { 0x4B10 } else { 0x4B20 };
@@ -83,9 +90,12 @@ impl Hotkeys {
                             let _ = UnregisterHotKey(Some(self.hwnd), id);
                         }
                     }
-                    return Err(format!(
-                        "快捷键 {} 注册失败（可能已被占用）：{error}；原绑定保留。",
-                        values[index]
+                    return Err(crate::locale::format(
+                        "could_not_register_hotkey_it_may_be",
+                        &[
+                            ("value1", &values[index].to_string()),
+                            ("error", &format!("{}", error)),
+                        ],
                     ));
                 }
                 registered.push(id);

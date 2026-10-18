@@ -141,7 +141,12 @@ pub struct Tray {
 
 impl Tray {
     pub fn new(hwnd: HWND) -> Result<Self, String> {
-        let icons = WindowIcons::new(hwnd).map_err(|error| format!("无法加载应用图标：{error}"))?;
+        let icons = WindowIcons::new(hwnd).map_err(|error| {
+            crate::locale::format(
+                "cannot_load_application_icon_error",
+                &[("error", &format!("{}", error))],
+            )
+        })?;
         let mut data = NOTIFYICONDATAW {
             cbSize: size_of::<NOTIFYICONDATAW>() as u32,
             hWnd: hwnd,
@@ -166,10 +171,16 @@ impl Tray {
         unsafe {
             let message = state.show_message;
             if message == 0 {
-                return Err("无法注册实例唤起消息。".into());
+                return Err(crate::locale::text(
+                    "cannot_register_instance_activation_message",
+                ));
             }
-            ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, None)
-                .map_err(|e| format!("无法设置实例唤起权限：{e}"))?;
+            ChangeWindowMessageFilterEx(hwnd, message, MSGFLT_ALLOW, None).map_err(|e| {
+                crate::locale::format(
+                    "cannot_set_instance_activation_permissions_e",
+                    &[("e", &format!("{}", e))],
+                )
+            })?;
             if !SetWindowSubclass(
                 hwnd,
                 Some(tray_proc),
@@ -178,12 +189,14 @@ impl Tray {
             )
             .as_bool()
             {
-                return Err("无法安装主窗口托盘处理。".into());
+                return Err(crate::locale::text(
+                    "cannot_install_main_window_tray_handler",
+                ));
             }
         }
         let tray = Self { state };
         if !tray.state.add_icon() {
-            return Err("无法添加系统托盘图标，主界面将保持可见。".into());
+            return Err(crate::locale::text("cannot_add_tray_icon_the_main_window"));
         }
         unsafe {
             SetPropW(
@@ -191,11 +204,27 @@ impl Tray {
                 windows::core::PCWSTR(crate::instance::property().as_ptr()),
                 Some(windows::Win32::Foundation::HANDLE(std::ptr::dangling_mut())),
             )
-            .map_err(|e| format!("无法标记主窗口：{e}"))?;
+            .map_err(|e| {
+                crate::locale::format("cannot_mark_main_window_e", &[("e", &format!("{}", e))])
+            })?;
         }
         Ok(tray)
     }
 
+    pub fn refresh_language(&self) {
+        let mut data = self.state.data.get();
+        data.szTip.fill(0);
+        let text = crate::window::wide(&format!(
+            "KeepWindow - {}",
+            crate::locale::text("window_protection")
+        ));
+        let length = text.len().min(data.szTip.len() - 1);
+        data.szTip[..length].copy_from_slice(&text[..length]);
+        self.state.data.set(data);
+        unsafe {
+            let _ = Shell_NotifyIconW(NIM_MODIFY, &data);
+        }
+    }
     pub fn hide(&self) {
         unsafe {
             let _ = ShowWindow(self.state.data.get().hWnd, SW_HIDE);

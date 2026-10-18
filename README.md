@@ -1,6 +1,10 @@
 # KeepWindow
 
-English documentation: [README.en.md](README.en.md). The app supports Simplified Chinese and English from **更多 → 语言**; the choice is saved in configuration.
+English documentation: [README.en.md](README.en.md).
+
+支持简体中文和 English，在 **更多 → 语言** 点击切换，即时生效并保存到配置。未设置时使用 Windows UI 语言；其他语言回退为简体中文。配置版本继续使用 2，旧配置无需修改。
+
+翻译资源位于 `locales/zh-CN.json` 和 `locales/en-US.json`，构建时验证键和命名占位符一致。程序内置两种语言，可单独运行；可执行文件旁同名资源存在时优先加载，损坏或不完整时使用内置中文。日志保留事件产生时的语言。
 
 [![CI](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/NeterAlex/KeepWindow?display_name=tag&sort=semver)](https://github.com/NeterAlex/KeepWindow/releases)

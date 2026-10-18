@@ -8,8 +8,15 @@ use windows::{
 use crate::window::wide;
 
 pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
-    let parent = path.parent().ok_or("存储目录不可用。")?;
-    fs::create_dir_all(parent).map_err(|e| format!("无法创建存储目录：{e}"))?;
+    let parent = path
+        .parent()
+        .ok_or(crate::locale::text("storage_directory_unavailable"))?;
+    fs::create_dir_all(parent).map_err(|e| {
+        crate::locale::format(
+            "cannot_create_storage_directory_e",
+            &[("e", &format!("{}", e))],
+        )
+    })?;
     let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
     let result = (|| {
         let mut file = fs::File::create(&temporary).map_err(|e| e.to_string())?;
@@ -26,7 +33,7 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> Result<(), String> {
                 MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
             )
         }
-        .map_err(|e| format!("原子保存失败：{e}"))
+        .map_err(|e| crate::locale::format("atomic_save_failed_e", &[("e", &format!("{}", e))]))
     })();
     if result.is_err() {
         let _ = fs::remove_file(temporary);
