@@ -1,0 +1,14 @@
+{
+  "language": "语言", "language_zh": "简体中文", "language_en": "English", "language_switched": "已切换为{language}", "window_protection": "后台窗口保护", "protection_notice": "保护提示",
+  "show_main": "显示主界面", "restore_all": "恢复全部窗口", "exit_restore": "退出并恢复保护",
+  "refresh": "刷新", "pick_window": "选择窗口", "more": "更多", "rules": "应用规则管理",
+  "hotkeys": "快捷键设置", "events": "最近事件与诊断", "protected_only": "仅看已保护",
+  "grouped": "按应用分组", "auxiliary": "显示辅助窗口", "advanced": "显示 PID 和句柄",
+  "startup": "开机启动（后台运行）", "system_protection": "系统保护", "mouse_shield": "鼠标遮罩",
+  "apply": "应用", "release_10": "放行 10 秒", "retry": "重试", "enable": "开启保护", "disable": "解除保护",
+  "calibrate": "校准", "save_rule": "保存规则", "export": "导出", "import_preview": "预览导入",
+  "unprotected": "未保护", "no_windows": "暂无可保护的窗口", "no_match": "没有匹配的窗口",
+  "search_hint": "搜索窗口名称、PID 或句柄", "status_ready": "选择一个窗口，设置保护方式后开启保护。",
+  "status_protected": "已保护前台窗口。", "status_restored": "已解除前台窗口保护。",
+  "status_retry_ok": "重试保护成功。", "unnamed": "未命名", "all_same": "所有同类窗口"
+}

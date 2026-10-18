@@ -42,6 +42,8 @@ pub struct Config {
     pub hotkeys: [String; 3],
     #[serde(default)]
     pub list: ListPreferences,
+    #[serde(default)]
+    pub language: Option<String>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -61,6 +63,7 @@ impl Default for Config {
             startup_enabled: false,
             hotkeys: Default::default(),
             list: ListPreferences::default(),
+            language: None,
         }
     }
 }
@@ -98,6 +101,11 @@ impl Config {
                 "不支持的配置版本：{}。原文件未修改。",
                 self.version
             ));
+        }
+        if let Some(language) = &self.language
+            && !matches!(language.as_str(), "zh-CN" | "en-US")
+        {
+            return Err("不支持的语言设置。".into());
         }
         for (index, rule) in self.rules.iter().enumerate() {
             if rule.path.is_empty() || rule.class.is_empty() {

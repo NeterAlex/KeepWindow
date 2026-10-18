@@ -92,7 +92,7 @@ jobs:
 
           New-Item -ItemType Directory -Path dist -Force | Out-Null
           $archive = "KeepWindow-v$version-windows-x64.zip"
-          Compress-Archive -Path target/release/keep-window.exe, README.md, LICENSE -DestinationPath "dist/$archive" -Force
+          Compress-Archive -Path target/release/keep-window.exe, README.md, README.en.md, LICENSE, locales -DestinationPath "dist/$archive" -Force
           $digest = (Get-FileHash -LiteralPath "dist/$archive" -Algorithm SHA256).Hash.ToLowerInvariant()
           "$digest  $archive`n" | Set-Content -LiteralPath "dist/$archive.sha256" -Encoding ascii -NoNewline
 

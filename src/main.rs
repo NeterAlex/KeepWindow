@@ -15,6 +15,8 @@ mod icon;
 #[cfg(windows)]
 mod instance;
 #[cfg(windows)]
+mod locale;
+#[cfg(windows)]
 mod mouse;
 #[cfg(windows)]
 mod picker;

@@ -1,0 +1,14 @@
+{
+  "language": "Language", "language_zh": "简体中文", "language_en": "English", "language_switched": "Language changed to {language}", "window_protection": "background window protection", "protection_notice": "Protection notice",
+  "show_main": "Show main window", "restore_all": "Restore all windows", "exit_restore": "Exit and restore protection",
+  "refresh": "Refresh", "pick_window": "Pick window", "more": "More", "rules": "Rule manager",
+  "hotkeys": "Hotkeys", "events": "Recent events and diagnostics", "protected_only": "Protected only",
+  "grouped": "Group by application", "auxiliary": "Show auxiliary windows", "advanced": "Show PID and handle",
+  "startup": "Start with Windows (background)", "system_protection": "System protection", "mouse_shield": "Mouse shield",
+  "apply": "Apply", "release_10": "Release for 10 seconds", "retry": "Retry", "enable": "Enable protection", "disable": "Remove protection",
+  "calibrate": "Calibrate", "save_rule": "Save rule", "export": "Export", "import_preview": "Preview import",
+  "unprotected": "Unprotected", "no_windows": "No protectable windows", "no_match": "No matching windows",
+  "search_hint": "Search window name, PID, or handle", "status_ready": "Select a window, configure protection, then enable it.",
+  "status_protected": "Foreground window protected.", "status_restored": "Foreground window protection removed.",
+  "status_retry_ok": "Protection retry succeeded.", "unnamed": "Unnamed", "all_same": "All windows of this class"
+}

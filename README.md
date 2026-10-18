@@ -1,5 +1,7 @@
 # KeepWindow
 
+English documentation: [README.en.md](README.en.md). The app supports Simplified Chinese and English from **更多 → 语言**; the choice is saved in configuration.
+
 [![CI](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/NeterAlex/KeepWindow/actions/workflows/ci.yml)
 [![Latest release](https://img.shields.io/github/v/release/NeterAlex/KeepWindow?display_name=tag&sort=semver)](https://github.com/NeterAlex/KeepWindow/releases)
 [![License](https://img.shields.io/github/license/NeterAlex/KeepWindow)](LICENSE)

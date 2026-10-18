@@ -116,6 +116,30 @@ impl From<Options> for Draft {
 }
 
 impl KeepWindow {
+    fn switch_language(&mut self, language: crate::locale::Language, cx: &mut Context<Self>) {
+        let previous = self.config.language.clone();
+        crate::locale::set(language);
+        let mut config = self.config.clone();
+        config.language = Some(language.code().to_string());
+        match self.store.save(&config) {
+            Ok(()) => {
+                self.config = config;
+                let label_key = if language == crate::locale::Language::EnUs {
+                    "language_en"
+                } else {
+                    "language_zh"
+                };
+                let label = crate::locale::text(label_key);
+                self.status =
+                    crate::locale::format("language_switched", &[("language", &label)]).into();
+            }
+            Err(error) => {
+                crate::locale::set(crate::locale::from_config(previous.as_deref()));
+                self.status = error.into();
+            }
+        }
+        cx.notify();
+    }
     fn record_status(&mut self) {
         let message = self.status.to_string();
         if self
@@ -533,6 +557,7 @@ impl KeepWindow {
         let title_contains =
             cx.new(|cx| InputState::new(window, cx).placeholder("标题关键词（可选）"));
         let (store, config, config_error) = Store::load();
+        crate::locale::set(crate::locale::from_config(config.language.as_deref()));
         let hotkey_inputs = std::array::from_fn(|index| {
             cx.new(|cx| {
                 InputState::new(window, cx)
@@ -632,7 +657,7 @@ impl KeepWindow {
             table,
             search,
             drafts: Vec::new(),
-            status: "选择一个窗口，设置保护方式后开启保护。".into(),
+            status: crate::locale::text("status_ready").into(),
             system_menu: true,
             mouse_shield: true,
             width,
@@ -1736,6 +1761,11 @@ impl Render for KeepWindow {
                     .item(PopupMenuItem::new("应用规则管理").on_click(window.listener_for(&view, |this, _, _, cx| { this.rules_open = !this.rules_open; cx.notify(); })))
                     .item(PopupMenuItem::new("快捷键设置").on_click(window.listener_for(&view, |this, _, _, cx| { this.hotkeys_open = !this.hotkeys_open; cx.notify(); })))
                     .item(PopupMenuItem::new("最近事件与诊断").on_click(window.listener_for(&view, |this, _, _, cx| { this.events_open = !this.events_open; cx.notify(); })))
+                    .item(PopupMenuItem::new(format!("{}: {}", crate::locale::text("language"), crate::locale::text(if crate::locale::current() == crate::locale::Language::EnUs { "language_en" } else { "language_zh" })))
+                        .on_click(window.listener_for(&view, |this, _, _, cx| {
+                            let next = if crate::locale::current() == crate::locale::Language::EnUs { crate::locale::Language::ZhCn } else { crate::locale::Language::EnUs };
+                            this.switch_language(next, cx);
+                        })))
                     .separator()
                     .item(PopupMenuItem::new("仅看已保护").checked(view.read(cx).config.list.protected_only).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(0, cx))))
                     .item(PopupMenuItem::new("按应用分组").checked(view.read(cx).config.list.grouped).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(1, cx))))

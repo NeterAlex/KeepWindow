@@ -98,10 +98,28 @@ impl State {
                 return;
             };
             let result = (|| -> windows::core::Result<()> {
-                AppendMenuW(menu, MF_STRING, SHOW_COMMAND, w!("显示主界面"))?;
-                AppendMenuW(menu, MF_STRING, RESTORE_COMMAND, w!("恢复全部窗口"))?;
+                let show = crate::window::wide(&crate::locale::text("show_main"));
+                let restore = crate::window::wide(&crate::locale::text("restore_all"));
+                let exit = crate::window::wide(&crate::locale::text("exit_restore"));
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    SHOW_COMMAND,
+                    windows::core::PCWSTR(show.as_ptr()),
+                )?;
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    RESTORE_COMMAND,
+                    windows::core::PCWSTR(restore.as_ptr()),
+                )?;
                 AppendMenuW(menu, MF_SEPARATOR, 0, None)?;
-                AppendMenuW(menu, MF_STRING, EXIT_COMMAND, w!("退出并恢复保护"))?;
+                AppendMenuW(
+                    menu,
+                    MF_STRING,
+                    EXIT_COMMAND,
+                    windows::core::PCWSTR(exit.as_ptr()),
+                )?;
                 let mut cursor = POINT::default();
                 GetCursorPos(&mut cursor)?;
                 let hwnd = self.data.get().hWnd;
@@ -133,7 +151,10 @@ impl Tray {
             hIcon: icons.small(),
             ..Default::default()
         };
-        let tooltip = crate::window::wide("KeepWindow - 后台窗口保护");
+        let tooltip = crate::window::wide(&format!(
+            "KeepWindow - {}",
+            crate::locale::text("window_protection")
+        ));
         data.szTip[..tooltip.len()].copy_from_slice(&tooltip);
         let state = Rc::new(State {
             data: Cell::new(data),
@@ -210,7 +231,10 @@ impl Tray {
         let mut data = self.state.data.get();
         data.uFlags = NIF_INFO;
         data.dwInfoFlags = NIIF_WARNING;
-        let title = crate::window::wide("KeepWindow 保护提示");
+        let title = crate::window::wide(&format!(
+            "KeepWindow {}",
+            crate::locale::text("protection_notice")
+        ));
         data.szInfoTitle[..title.len()].copy_from_slice(&title);
         let text: Vec<u16> = text.encode_utf16().take(data.szInfo.len() - 1).collect();
         data.szInfo[..text.len()].copy_from_slice(&text);
