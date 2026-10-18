@@ -24,6 +24,7 @@ use windows::{
 use crate::{
     mouse::MouseRegistration,
     recovery::{Identity, Recovery},
+    runtime::FailureKind,
     window::{WindowInfo, is_cloaked, valid_rect, wide},
 };
 
@@ -134,6 +135,54 @@ pub struct Protection {
 }
 
 impl Protection {
+    pub fn failure_kind(target: &WindowInfo, recovery: &Recovery) -> FailureKind {
+        if !target.is_same_window() {
+            return FailureKind::Gone;
+        }
+        if !recovery.can_protect(target) {
+            return FailureKind::Permanent;
+        }
+        unsafe {
+            use windows::Win32::{
+                Foundation::CloseHandle,
+                Security::{GetTokenInformation, TOKEN_ELEVATION, TOKEN_QUERY, TokenElevation},
+                System::Threading::{
+                    GetCurrentProcess, OpenProcess, OpenProcessToken,
+                    PROCESS_QUERY_LIMITED_INFORMATION,
+                },
+            };
+            fn elevated(process: HANDLE) -> Option<bool> {
+                unsafe {
+                    let mut token = HANDLE::default();
+                    OpenProcessToken(process, TOKEN_QUERY, &mut token).ok()?;
+                    let mut elevation = TOKEN_ELEVATION::default();
+                    let mut size = 0;
+                    let result = GetTokenInformation(
+                        token,
+                        TokenElevation,
+                        Some((&mut elevation as *mut TOKEN_ELEVATION).cast()),
+                        size_of::<TOKEN_ELEVATION>() as u32,
+                        &mut size,
+                    );
+                    let _ = CloseHandle(token);
+                    result.ok().map(|_| elevation.TokenIsElevated != 0)
+                }
+            }
+            let Ok(process) = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, target.pid)
+            else {
+                return FailureKind::Permanent;
+            };
+            let target_elevated = elevated(process);
+            let own_elevated = elevated(GetCurrentProcess());
+            let _ = CloseHandle(process);
+            if target_elevated.is_none()
+                || target_elevated == Some(true) && own_elevated != Some(true)
+            {
+                return FailureKind::Permanent;
+            }
+        }
+        FailureKind::Transient
+    }
     #[cfg(test)]
     pub fn start(target: WindowInfo, options: Options) -> Result<Self, String> {
         Self::start_logged(target, options, Recovery::testing())

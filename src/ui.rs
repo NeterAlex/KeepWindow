@@ -62,11 +62,13 @@ pub fn init_theme(cx: &mut App) {
 }
 
 pub struct WindowRow {
+    pub application: String,
     pub info: WindowInfo,
     pub protection: Option<(String, String)>,
 }
 
 pub struct WindowTable {
+    pub advanced: bool,
     pub rows: Vec<WindowRow>,
     pub filtered: bool,
     pub selected_row: Option<usize>,
@@ -78,11 +80,15 @@ pub struct WindowTable {
 impl WindowTable {
     pub fn new() -> Self {
         Self {
+            advanced: false,
             rows: Vec::new(),
             filtered: false,
             selected_row: None,
             layout_width: px(0.),
             columns: vec![
+                Column::new("application", "应用")
+                    .width(150.)
+                    .min_width(90.),
                 Column::new("title", "窗口名称").width(430.).min_width(200.),
                 Column::new("pid", "PID").width(86.).min_width(70.),
                 Column::new("handle", "窗口句柄")
@@ -139,16 +145,16 @@ impl WindowTable {
             return false;
         }
         self.layout_width = width;
-        self.columns[0] = self.columns[0]
+        self.columns[1] = self.columns[1]
             .clone()
-            .width((width - px(364.)).max(px(200.)));
+            .width((width - px(if self.advanced { 514. } else { 272. })).max(px(200.)));
         true
     }
 }
 
 impl TableDelegate for WindowTable {
     fn columns_count(&self, _: &App) -> usize {
-        self.columns.len()
+        if self.advanced { 5 } else { 3 }
     }
 
     fn rows_count(&self, _: &App) -> usize {
@@ -156,7 +162,12 @@ impl TableDelegate for WindowTable {
     }
 
     fn column(&self, col_ix: usize, _: &App) -> Column {
-        self.columns[col_ix].clone()
+        self.columns[if !self.advanced && col_ix == 2 {
+            4
+        } else {
+            col_ix
+        }]
+        .clone()
     }
 
     fn render_tr(
@@ -179,8 +190,16 @@ impl TableDelegate for WindowTable {
         let selected = self.selected_row == Some(row_ix);
         let theme = cx.theme();
         let cell = div().size_full().flex().items_center().text_sm();
-        match col_ix {
-            0 => {
+        let column = if !self.advanced && col_ix == 2 {
+            4
+        } else {
+            col_ix
+        };
+        match column {
+            0 => cell
+                .child(div().truncate().child(row.application.clone()))
+                .into_any_element(),
+            1 => {
                 let title = row.info.display_title();
                 let icon = div().size(px(16.)).flex_shrink_0().child(
                     self.icons
@@ -223,12 +242,12 @@ impl TableDelegate for WindowTable {
                     )
                     .into_any_element()
             }
-            1 => cell
+            2 => cell
                 .font_family("Consolas")
                 .text_color(theme.muted_foreground)
                 .child(row.info.pid.to_string())
                 .into_any_element(),
-            2 => cell
+            3 => cell
                 .font_family("Consolas")
                 .text_color(theme.muted_foreground)
                 .child(format!("0x{:X}", row.info.hwnd.0 as usize))

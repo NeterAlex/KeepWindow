@@ -37,6 +37,8 @@ pub enum Action {
     Show,
     RestoreAll,
     Exit,
+    Toggle(HWND),
+    Release(HWND),
 }
 
 struct State {
@@ -196,6 +198,14 @@ impl Tray {
         self.state.actions.borrow_mut().drain(..).collect()
     }
 
+    pub fn hwnd(&self) -> HWND {
+        self.state.data.get().hWnd
+    }
+
+    pub fn visible(&self) -> bool {
+        unsafe { IsWindowVisible(self.hwnd()).as_bool() }
+    }
+
     pub fn notify(&self, text: &str) {
         let mut data = self.state.data.get();
         data.uFlags = NIF_INFO;
@@ -255,6 +265,16 @@ unsafe extern "system" fn tray_proc(
             return LRESULT(0);
         }
         match message {
+            WM_HOTKEY => {
+                let target = GetAncestor(GetForegroundWindow(), GA_ROOT);
+                match wparam.0 & 0xF {
+                    0 => state.queue(Action::Toggle(target)),
+                    1 => state.queue(Action::Release(target)),
+                    2 => state.queue(Action::RestoreAll),
+                    _ => {}
+                }
+                LRESULT(0)
+            }
             WM_DPICHANGED => {
                 state.update_icons((wparam.0 & 0xFFFF) as u32);
                 DefSubclassProc(hwnd, message, wparam, lparam)

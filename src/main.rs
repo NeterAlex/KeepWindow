@@ -7,6 +7,10 @@ mod calibration;
 #[cfg(windows)]
 mod config;
 #[cfg(windows)]
+mod events;
+#[cfg(windows)]
+mod hotkeys;
+#[cfg(windows)]
 mod icon;
 #[cfg(windows)]
 mod instance;
@@ -18,6 +22,8 @@ mod picker;
 mod protection;
 #[cfg(windows)]
 mod recovery;
+#[cfg(windows)]
+mod runtime;
 #[cfg(windows)]
 mod startup;
 #[cfg(windows)]

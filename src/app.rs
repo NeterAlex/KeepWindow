@@ -29,9 +29,12 @@ use windows::Win32::Foundation::HWND;
 use crate::{
     calibration::{Calibration, Outcome},
     config::{Config, Rule, Store},
+    events::Events,
+    hotkeys::Hotkeys,
     picker::Picker,
     protection::{Options, Protection},
     recovery::Recovery,
+    runtime::{Attempt, Release},
     tray::{Action as TrayAction, Tray},
     ui::{self, WindowRow, WindowTable},
     window::{self, WindowInfo},
@@ -63,7 +66,20 @@ pub struct KeepWindow {
     rule_settings_open: bool,
     editing_rule: Option<usize>,
     suppressed: Vec<WindowInfo>,
-    attempts: Vec<(WindowInfo, Rule, Option<String>)>,
+    attempts: Vec<Attempt>,
+    releases: Vec<Release>,
+    hotkeys: Option<Hotkeys>,
+    hotkey_inputs: [Entity<InputState>; 3],
+    hotkeys_open: bool,
+    events: Events,
+    events_open: bool,
+    include_private: bool,
+    rule_name: Entity<InputState>,
+    transfer_path: Entity<InputState>,
+    imported: Option<Vec<Rule>>,
+    undo_rules: Option<Vec<Rule>>,
+    confirmed: Vec<WindowInfo>,
+    pinned: Vec<WindowInfo>,
     paths: HashMap<u32, (Option<u64>, Option<String>)>,
     last_scan: Instant,
     exiting: bool,
@@ -100,6 +116,354 @@ impl From<Options> for Draft {
 }
 
 impl KeepWindow {
+    fn record_status(&mut self) {
+        let message = self.status.to_string();
+        if self
+            .events
+            .entries
+            .back()
+            .is_none_or(|event| event.source != "操作" || event.detail != message)
+        {
+            self.events.push("操作", message);
+        }
+    }
+
+    fn foreground_action(&mut self, hwnd: HWND, temporary: bool, cx: &mut Context<Self>) {
+        if self.picker.is_some() || self.calibration.is_some() {
+            return;
+        }
+        let Some(target) =
+            WindowInfo::inspect(hwnd).filter(|target| target.pid != std::process::id())
+        else {
+            return;
+        };
+        if temporary {
+            self.release_target(target, cx);
+            return;
+        }
+        if let Some(index) = self
+            .releases
+            .iter()
+            .position(|release| release.target.same_identity(&target))
+        {
+            self.releases.remove(index);
+            self.suppressed.push(target);
+            self.status = "已取消临时放行后的自动恢复。".into();
+        } else if let Some(index) = self
+            .protections
+            .iter()
+            .position(|p| p.target.same_identity(&target))
+        {
+            self.suppressed.push(target.clone());
+            match self.protections[index].restore() {
+                Ok(()) => {
+                    self.protections.remove(index);
+                    self.status = "已解除前台窗口保护。".into();
+                }
+                Err(error) => self.status = error.into(),
+            }
+        } else {
+            let options = window::process_path(target.pid)
+                .and_then(|path| {
+                    self.config
+                        .matching_rule(&path, &target, false)
+                        .map(|(_, rule)| rule.options)
+                })
+                .unwrap_or_default();
+            self.suppressed.retain(|item| !item.same_identity(&target));
+            self.attempts
+                .retain(|attempt| !attempt.target.same_identity(&target));
+            match Protection::start_logged(target, options, self.recovery.clone()) {
+                Ok(protection) => {
+                    self.protections.push(protection);
+                    self.status = "已保护前台窗口。".into();
+                }
+                Err(error) => self.status = error.into(),
+            }
+        }
+        self.rebuild_table(cx);
+        if let Some(tray) = &self.tray {
+            tray.notify(&self.status);
+        }
+        cx.notify();
+    }
+
+    fn release_target(&mut self, target: WindowInfo, cx: &mut Context<Self>) {
+        if let Some(release) = self
+            .releases
+            .iter_mut()
+            .find(|release| release.target.same_identity(&target))
+        {
+            release.deadline = Instant::now() + Duration::from_secs(10);
+            self.status = "临时放行已重置为 10 秒。".into();
+        } else if let Some(index) = self
+            .protections
+            .iter()
+            .position(|p| p.target.same_identity(&target))
+        {
+            let result = crate::recovery::Identity::capture(&target).and_then(|identity| {
+                let options = self.protections[index].options;
+                self.protections[index].restore()?;
+                Ok(Release {
+                    target,
+                    identity,
+                    options,
+                    deadline: Instant::now() + Duration::from_secs(10),
+                })
+            });
+            match result {
+                Ok(release) => {
+                    self.protections.remove(index);
+                    self.releases.push(release);
+                    self.status = "已临时放行，10 秒后恢复保护。".into();
+                }
+                Err(error) => self.status = format!("临时放行失败：{error}").into(),
+            }
+        } else {
+            self.status = "目标窗口尚未保护。".into();
+        }
+        self.rebuild_table(cx);
+        cx.notify();
+    }
+
+    fn tick_releases(&mut self, cx: &mut Context<Self>) {
+        let mut pending = Vec::new();
+        let mut changed = false;
+        for release in std::mem::take(&mut self.releases) {
+            if !crate::recovery::Identity::capture(&release.target)
+                .is_ok_and(|current| release.identity.matches(&current))
+            {
+                self.events
+                    .push("临时放行", "窗口已关闭或身份无法验证，取消恢复。");
+                changed = true;
+            } else if Instant::now() < release.deadline
+                || self.picker.is_some()
+                || self.calibration.is_some()
+            {
+                pending.push(release);
+            } else {
+                changed = true;
+                match Protection::start_logged(
+                    release.target.clone(),
+                    release.options,
+                    self.recovery.clone(),
+                ) {
+                    Ok(protection) => {
+                        self.protections.push(protection);
+                        self.status = "临时放行结束，保护已恢复。".into();
+                    }
+                    Err(error) => {
+                        self.status =
+                            format!("临时放行后恢复保护失败：{error}；可选中窗口重试。").into();
+                        self.suppressed.push(release.target.clone());
+                        let path = window::process_path(release.target.pid).unwrap_or_default();
+                        self.attempts.push(Attempt::failed(
+                            release.target.clone(),
+                            Rule {
+                                name: "临时放行恢复".into(),
+                                path,
+                                class: release.target.class.clone(),
+                                title_contains: String::new(),
+                                automatic: false,
+                                options: release.options,
+                            },
+                            error,
+                            crate::runtime::FailureKind::Permanent,
+                            Instant::now(),
+                        ));
+                        if let Some(tray) = &self.tray {
+                            tray.notify(&self.status);
+                        }
+                    }
+                }
+            }
+        }
+        self.releases = pending;
+        if changed {
+            self.rebuild_table(cx);
+            cx.notify();
+        }
+    }
+
+    fn retry_selected(&mut self, cx: &mut Context<Self>) {
+        let Some(target) = self.selected.clone() else {
+            return;
+        };
+        let options = self
+            .attempts
+            .iter()
+            .find(|attempt| attempt.target.same_identity(&target))
+            .map(|attempt| attempt.rule.options);
+        self.attempts
+            .retain(|attempt| !attempt.target.same_identity(&target));
+        self.suppressed.retain(|item| !item.same_identity(&target));
+        if let Some(options) = options {
+            match Protection::start_logged(target, options, self.recovery.clone()) {
+                Ok(protection) => {
+                    self.protections.push(protection);
+                    self.status = "重试保护成功。".into();
+                }
+                Err(error) => self.status = error.into(),
+            }
+            self.rebuild_table(cx);
+        } else {
+            self.protect(cx);
+        }
+        cx.notify();
+    }
+
+    fn save_hotkeys(&mut self, cx: &mut Context<Self>) {
+        let values = std::array::from_fn(|index| {
+            self.hotkey_inputs[index]
+                .read(cx)
+                .value()
+                .trim()
+                .to_string()
+        });
+        let previous = self.config.hotkeys.clone();
+        let result = self
+            .hotkeys
+            .as_mut()
+            .ok_or_else(|| "托盘不可用，无法注册快捷键。".to_string())
+            .and_then(|keys| keys.replace(&values));
+        match result {
+            Ok(()) => {
+                let mut config = self.config.clone();
+                config.hotkeys = values;
+                match self.store.save(&config) {
+                    Ok(()) => {
+                        self.config = config;
+                        self.status = "快捷键设置已保存。".into();
+                    }
+                    Err(error) => {
+                        let rollback = self.hotkeys.as_mut().unwrap().replace(&previous);
+                        self.status = format!(
+                            "{error}{}",
+                            rollback
+                                .err()
+                                .map(|error| format!("；恢复原快捷键失败：{error}"))
+                                .unwrap_or_default()
+                        )
+                        .into();
+                    }
+                }
+            }
+            Err(error) => self.status = error.into(),
+        }
+        cx.notify();
+    }
+
+    fn transfer_rules(&mut self, import: bool, cx: &mut Context<Self>) {
+        let path = std::path::PathBuf::from(self.transfer_path.read(cx).value().trim());
+        let result = if !path.is_absolute() {
+            Err("请输入 JSON 文件的完整绝对路径。".into())
+        } else if import {
+            std::fs::read(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| {
+                    serde_json::from_slice::<Vec<Rule>>(&bytes).map_err(|e| e.to_string())
+                })
+                .and_then(|rules| {
+                    let config = Config {
+                        rules: rules.clone(),
+                        ..Config::default()
+                    };
+                    config.validate()?;
+                    let conflicts = rules
+                        .iter()
+                        .filter(|rule| {
+                            self.config
+                                .rules
+                                .iter()
+                                .any(|existing| existing.same_key(rule))
+                        })
+                        .count();
+                    let count = rules.len();
+                    self.imported = Some(rules);
+                    Ok(format!(
+                        "导入预览：新增 {} 条，冲突 {conflicts} 条。选择保留已有或覆盖。",
+                        count - conflicts
+                    ))
+                })
+        } else {
+            serde_json::to_vec_pretty(&self.config.rules)
+                .map_err(|e| e.to_string())
+                .and_then(|bytes| crate::storage::atomic_write(&path, &bytes))
+                .map(|()| "规则已导出（仅含规则）。".into())
+        };
+        self.status = result
+            .unwrap_or_else(|error| format!("规则传输失败：{error}"))
+            .into();
+        cx.notify();
+    }
+
+    fn confirm_import(&mut self, overwrite: bool, cx: &mut Context<Self>) {
+        if let Some(rules) = self.imported.take() {
+            let mut config = self.config.clone();
+            for rule in rules {
+                if overwrite || !config.rules.iter().any(|existing| existing.same_key(&rule)) {
+                    config.upsert(rule, None);
+                }
+            }
+            self.commit_config(config);
+            self.editing_rule = None;
+        }
+        cx.notify();
+    }
+
+    fn toggle_list(&mut self, field: usize, cx: &mut Context<Self>) {
+        let mut config = self.config.clone();
+        let value = match field {
+            0 => &mut config.list.protected_only,
+            1 => &mut config.list.grouped,
+            2 => &mut config.list.show_auxiliary,
+            _ => &mut config.list.advanced_columns,
+        };
+        *value = !*value;
+        self.commit_config(config);
+        self.rebuild_table(cx);
+        cx.notify();
+    }
+
+    fn diagnostic(&self) -> String {
+        let mut text = format!(
+            "KeepWindow {}\nWindows {}\n保护：{}\n待重试：{}\n临时放行：{}\n",
+            env!("CARGO_PKG_VERSION"),
+            std::env::var("OS").unwrap_or_else(|_| "Windows".into()),
+            self.protections.len(),
+            self.attempts.len(),
+            self.releases.len()
+        );
+        if self.include_private {
+            for event in &self.events.entries {
+                text.push_str(&format!(
+                    "{} [{}] {} ({} 次)\n",
+                    event.time, event.source, event.detail, event.count
+                ));
+            }
+            for target in &self.windows {
+                text.push_str(&format!(
+                    "{} | {}\n",
+                    target.display_title(),
+                    self.path_for(target).unwrap_or("未知路径")
+                ));
+            }
+        } else {
+            text.push_str("隐私模式：窗口标题、路径和自由文本错误已省略。\n");
+            for attempt in &self.attempts {
+                text.push_str(if attempt.waiting() {
+                    "保护失败：等待重试\n"
+                } else {
+                    "保护失败：需要手动处理\n"
+                });
+            }
+            for protection in &self.protections {
+                text.push_str(&format!("状态：{}\n", protection.status().label()));
+            }
+        }
+        text
+    }
+
     fn new(
         window: &mut Window,
         cx: &mut Context<Self>,
@@ -169,6 +533,20 @@ impl KeepWindow {
         let title_contains =
             cx.new(|cx| InputState::new(window, cx).placeholder("标题关键词（可选）"));
         let (store, config, config_error) = Store::load();
+        let hotkey_inputs = std::array::from_fn(|index| {
+            cx.new(|cx| {
+                InputState::new(window, cx)
+                    .placeholder("留空禁用，如 Ctrl+Alt+K")
+                    .default_value(config.hotkeys[index].clone())
+            })
+        });
+        let rule_name = cx.new(|cx| InputState::new(window, cx).placeholder("规则名称（可选）"));
+        let transfer_path =
+            cx.new(|cx| InputState::new(window, cx).placeholder("规则 JSON 文件完整路径"));
+        let mut hotkeys = tray.as_ref().ok().map(|tray| Hotkeys::new(tray.hwnd()));
+        let hotkey_error = hotkeys
+            .as_mut()
+            .and_then(|keys| keys.replace(&config.hotkeys).err());
         let table = cx.new(|cx| {
             TableState::new(WindowTable::new(), window, cx)
                 .col_selectable(false)
@@ -229,6 +607,7 @@ impl KeepWindow {
             &top_offset,
             &opacity,
             &title_contains,
+            &rule_name,
         ] {
             subscriptions.push(cx.subscribe(input, |_, _, event, cx| {
                 if matches!(event, InputEvent::Change) {
@@ -273,6 +652,19 @@ impl KeepWindow {
             editing_rule: None,
             suppressed: Vec::new(),
             attempts: Vec::new(),
+            releases: Vec::new(),
+            hotkeys,
+            hotkey_inputs,
+            hotkeys_open: false,
+            events: Events::default(),
+            events_open: false,
+            include_private: false,
+            rule_name,
+            transfer_path,
+            imported: None,
+            undo_rules: None,
+            confirmed: Vec::new(),
+            pinned: Vec::new(),
             paths: HashMap::new(),
             last_scan: Instant::now(),
             exiting: false,
@@ -289,10 +681,17 @@ impl KeepWindow {
                             this.tick_picker(window, cx);
                             this.tick_calibration(window, cx);
                             this.tick(cx);
-                            if this.last_scan.elapsed() >= Duration::from_secs(1) {
+                            this.tick_releases(cx);
+                            let visible = this.tray.as_ref().is_none_or(Tray::visible);
+                            let automatic = this.config.rules.iter().any(|rule| rule.automatic);
+                            if (visible || automatic)
+                                && this.last_scan.elapsed()
+                                    >= Duration::from_secs(if visible { 1 } else { 3 })
+                            {
                                 this.scan(cx);
                             }
                             this.process_tray_actions(cx);
+                            this.record_status();
                         })
                         .is_err()
                     {
@@ -311,6 +710,9 @@ impl KeepWindow {
         }
         this.scan(cx);
         let mut messages = Vec::new();
+        if let Some(error) = hotkey_error {
+            messages.push(error);
+        }
         if let Some(message) = recovery_message {
             messages.push(message);
         }
@@ -354,10 +756,19 @@ impl KeepWindow {
                 }
                 self.suppressed.retain(|target| target.is_same_window());
                 self.attempts
-                    .retain(|(target, _, _)| target.is_same_window());
+                    .retain(|attempt| attempt.target.is_same_window());
+                self.pinned.retain(WindowInfo::is_same_window);
+                self.confirmed.retain(WindowInfo::is_same_window);
                 self.paths
                     .retain(|pid, _| windows.iter().any(|item| item.pid == *pid));
                 for target in &windows {
+                    if windows
+                        .iter()
+                        .find(|item| item.pid == target.pid)
+                        .is_some_and(|first| first.hwnd != target.hwnd)
+                    {
+                        continue;
+                    }
                     let creation = window::process_creation(target.pid);
                     if self
                         .paths
@@ -427,6 +838,8 @@ impl KeepWindow {
                     self.refresh(cx);
                 }
                 TrayAction::RestoreAll => self.restore_all(cx),
+                TrayAction::Toggle(hwnd) => self.foreground_action(hwnd, false, cx),
+                TrayAction::Release(hwnd) => self.foreground_action(hwnd, true, cx),
                 TrayAction::Exit => {
                     self.exit(cx);
                     break;
@@ -437,6 +850,7 @@ impl KeepWindow {
 
     fn exit(&mut self, cx: &mut Context<Self>) {
         self.exiting = true;
+        self.hotkeys.take();
         self.picker.take();
         self.calibration.take();
         for protection in &mut self.protections {
@@ -566,11 +980,45 @@ impl KeepWindow {
             self.save_draft(cx);
             self.selected = None;
         }
-        let rows: Vec<_> = self
+        let mut rows: Vec<_> = self
             .windows
             .iter()
-            .filter(|item| item.matches_query(&query))
+            .filter(|item| {
+                let special = self.protection_for(item).is_some()
+                    || self
+                        .attempts
+                        .iter()
+                        .any(|attempt| attempt.target.same_identity(item))
+                    || self
+                        .releases
+                        .iter()
+                        .any(|release| release.target.same_identity(item))
+                    || self.pinned.iter().any(|target| target.same_identity(item));
+                let search = format!(
+                    "{} {} {} {} 0x{:x} {}",
+                    item.title,
+                    item.class,
+                    item.pid,
+                    item.display_title(),
+                    item.hwnd.0 as usize,
+                    self.path_for(item).unwrap_or("")
+                )
+                .to_lowercase();
+                query.split_whitespace().all(|term| search.contains(term))
+                    && (!self.config.list.protected_only
+                        || self.protection_for(item).is_some()
+                        || self
+                            .releases
+                            .iter()
+                            .any(|release| release.target.same_identity(item)))
+                    && (self.config.list.show_auxiliary || special || !item.auxiliary())
+            })
             .map(|item| WindowRow {
+                application: self
+                    .path_for(item)
+                    .and_then(|path| path.rsplit('\\').next())
+                    .map(str::to_string)
+                    .unwrap_or_else(|| format!("PID {}", item.pid)),
                 info: item.clone(),
                 protection: self
                     .protection_for(item)
@@ -579,15 +1027,46 @@ impl KeepWindow {
                         (status.label().into(), status.description())
                     })
                     .or_else(|| {
+                        self.releases
+                            .iter()
+                            .find(|release| release.target.same_identity(item))
+                            .map(|_| {
+                                (
+                                    "临时放行".into(),
+                                    "10 秒后恢复保护；再次放行可重置倒计时。".into(),
+                                )
+                            })
+                    })
+                    .or_else(|| {
                         self.attempts
                             .iter()
-                            .find(|(target, _, error)| {
-                                target.same_identity(item) && error.is_some()
+                            .find(|attempt| {
+                                attempt.target.same_identity(item) && attempt.error.is_some()
                             })
-                            .map(|(_, _, error)| ("保护失败".into(), error.clone().unwrap()))
+                            .map(|attempt| {
+                                (
+                                    if attempt.waiting() {
+                                        "等待重试"
+                                    } else {
+                                        "保护失败"
+                                    }
+                                    .into(),
+                                    attempt.error.clone().unwrap(),
+                                )
+                            })
                     }),
             })
             .collect();
+        if self.config.list.grouped {
+            rows.sort_by_key(|row| {
+                (
+                    self.path_for(&row.info)
+                        .map(str::to_lowercase)
+                        .unwrap_or_else(|| format!("pid:{}", row.info.pid)),
+                    row.info.title.to_lowercase(),
+                )
+            });
+        }
         let selected_row = self
             .selected
             .as_ref()
@@ -597,6 +1076,7 @@ impl KeepWindow {
             self.selected = None;
         }
         self.table.update(cx, |table, cx| {
+            table.delegate_mut().advanced = self.config.list.advanced_columns;
             table.delegate_mut().rows = rows;
             table.delegate_mut().filtered = !query.is_empty();
             table.delegate_mut().selected_row = selected_row;
@@ -667,7 +1147,7 @@ impl KeepWindow {
         }
         self.suppressed.retain(|item| !item.same_identity(&target));
         self.attempts
-            .retain(|(item, _, _)| !item.same_identity(&target));
+            .retain(|attempt| !attempt.target.same_identity(&target));
         self.save_draft(cx);
         match self.options(cx) {
             Ok(options) => {
@@ -701,6 +1181,8 @@ impl KeepWindow {
             return;
         };
         self.suppressed.push(target.clone());
+        self.releases
+            .retain(|release| !release.target.same_identity(&target));
         match self.protections[index].restore() {
             Ok(()) => {
                 self.protections.remove(index);
@@ -713,6 +1195,17 @@ impl KeepWindow {
     }
 
     fn restore_all(&mut self, cx: &mut Context<Self>) {
+        self.picker.take();
+        self.calibration.take();
+        for protection in &mut self.protections {
+            protection.set_calibration(None);
+        }
+        self.suppressed
+            .extend(self.releases.iter().map(|release| release.target.clone()));
+        self.releases.clear();
+        self.suppressed
+            .extend(self.attempts.iter().map(|attempt| attempt.target.clone()));
+        self.attempts.clear();
         self.suppressed
             .extend(self.protections.iter().map(|p| p.target.clone()));
         let mut errors = Vec::new();
@@ -745,6 +1238,10 @@ impl KeepWindow {
         for target in self.windows.clone() {
             if self.protection_for(&target).is_some()
                 || self
+                    .releases
+                    .iter()
+                    .any(|release| release.target.same_identity(&target))
+                || self
                     .suppressed
                     .iter()
                     .any(|item| item.same_identity(&target))
@@ -758,27 +1255,46 @@ impl KeepWindow {
             let Some(rule) = rule else {
                 continue;
             };
-            if self
+            let previous = self
                 .attempts
                 .iter()
-                .any(|(item, previous, _)| item.same_identity(&target) && previous == &rule)
-            {
+                .position(|attempt| attempt.target.same_identity(&target) && attempt.rule == rule);
+            if previous.is_some_and(|index| !self.attempts[index].due(Instant::now())) {
                 continue;
             }
-            self.attempts
-                .retain(|(item, _, _)| !item.same_identity(&target));
             match Protection::start_logged(target.clone(), rule.options, self.recovery.clone()) {
                 Ok(protection) => {
                     self.protections.push(protection);
-                    self.attempts.push((target, rule, None));
+                    self.attempts
+                        .retain(|attempt| !attempt.target.same_identity(&target));
+                    self.events
+                        .push("自动保护", format!("已保护 {}", target.display_title()));
                 }
                 Err(error) => {
-                    self.status =
-                        format!("自动保护“{}”失败：{error}", target.display_title()).into();
-                    if let Some(tray) = &self.tray {
-                        tray.notify(&self.status);
+                    let kind = Protection::failure_kind(&target, &self.recovery);
+                    let notify = if let Some(index) = previous {
+                        self.attempts[index].fail_again(error.clone(), kind, Instant::now());
+                        !self.attempts[index].waiting()
+                    } else {
+                        self.attempts
+                            .retain(|attempt| !attempt.target.same_identity(&target));
+                        self.attempts.push(Attempt::failed(
+                            target.clone(),
+                            rule,
+                            error.clone(),
+                            kind,
+                            Instant::now(),
+                        ));
+                        true
+                    };
+                    let message = format!("自动保护“{}”失败：{error}", target.display_title());
+                    self.events.push("自动重试", message.clone());
+                    if notify {
+                        self.status = message.into();
+                        if let Some(tray) = &self.tray {
+                            tray.notify(&self.status);
+                        }
                     }
-                    self.attempts.push((target, rule, Some(error)));
                 }
             }
         }
@@ -816,6 +1332,7 @@ impl KeepWindow {
                 .or_else(|| target.map(|target| target.class.clone()))
                 .ok_or("请先选择窗口。")?;
             Ok(Rule {
+                name: self.rule_name.read(cx).value().trim().to_string(),
                 path: path.into(),
                 class,
                 title_contains: self.title_contains.read(cx).value().trim().to_string(),
@@ -839,7 +1356,7 @@ impl KeepWindow {
         match self.store.save(&config) {
             Ok(()) => {
                 self.attempts
-                    .retain(|(_, rule, _)| config.rules.iter().any(|current| current == rule));
+                    .retain(|attempt| config.rules.iter().any(|current| current == &attempt.rule));
                 self.config = config;
                 self.status = "应用规则已保存。".into();
             }
@@ -852,6 +1369,9 @@ impl KeepWindow {
         self.selected = None;
         self.rebuild_table(cx);
         let rule = self.config.rules[index].clone();
+        self.rule_name.update(cx, |state, cx| {
+            state.set_value(rule.name.clone(), window, cx)
+        });
         self.set_fields(rule.options, window, cx);
         self.title_contains.update(cx, |state, cx| {
             state.set_value(rule.title_contains, window, cx)
@@ -946,6 +1466,7 @@ impl KeepWindow {
         }
         match outcome {
             Ok(Some(Some(target))) => {
+                self.pinned.push(target.clone());
                 // Suppress automatic rules for this target until the user explicitly protects it.
                 self.suppressed.push(target.clone());
                 self.search
@@ -1029,6 +1550,9 @@ impl KeepWindow {
         }
         let calibration = self.calibration.take().unwrap();
         let saved = matches!(outcome, Ok(Some(Outcome::Save)));
+        if saved {
+            self.confirmed.push(calibration.target.clone());
+        }
         let options = if saved {
             calibration.current
         } else {
@@ -1210,6 +1734,13 @@ impl Render for KeepWindow {
                 menu.item(PopupMenuItem::new("恢复全部窗口").icon(IconName::RotateCcw).disabled(restore_disabled)
                     .on_click(window.listener_for(&view, |this, _, _, cx| this.restore_all(cx))))
                     .item(PopupMenuItem::new("应用规则管理").on_click(window.listener_for(&view, |this, _, _, cx| { this.rules_open = !this.rules_open; cx.notify(); })))
+                    .item(PopupMenuItem::new("快捷键设置").on_click(window.listener_for(&view, |this, _, _, cx| { this.hotkeys_open = !this.hotkeys_open; cx.notify(); })))
+                    .item(PopupMenuItem::new("最近事件与诊断").on_click(window.listener_for(&view, |this, _, _, cx| { this.events_open = !this.events_open; cx.notify(); })))
+                    .separator()
+                    .item(PopupMenuItem::new("仅看已保护").checked(view.read(cx).config.list.protected_only).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(0, cx))))
+                    .item(PopupMenuItem::new("按应用分组").checked(view.read(cx).config.list.grouped).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(1, cx))))
+                    .item(PopupMenuItem::new("显示辅助窗口").checked(view.read(cx).config.list.show_auxiliary).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(2, cx))))
+                    .item(PopupMenuItem::new("显示 PID 和句柄").checked(view.read(cx).config.list.advanced_columns).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_list(3, cx))))
                     .item(PopupMenuItem::new("开机启动（后台运行）").checked(view.read(cx).startup_enabled).on_click(window.listener_for(&view, |this, _, _, cx| this.toggle_startup(cx))))
                     .separator()
                     .item(PopupMenuItem::new("退出并恢复").icon(IconName::LogOut)
@@ -1240,6 +1771,8 @@ impl Render for KeepWindow {
                         .tooltip(if self.rule_settings_open { "收起规则设置" } else { "展开标题匹配、自动保护和保存规则" }).disabled(!editable && !self.rule_settings_open)
                         .on_click(cx.listener(|this, _, _, cx| { this.rule_settings_open = !this.rule_settings_open; cx.notify(); })))
                     .when(protected, |row| row.child(Button::new("apply").small().h(control_height).label("应用").tooltip("将修改后的设置应用到当前窗口").disabled(!can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.apply_settings(cx)))))
+                    .when(protected, |row| row.child(Button::new("release-ten").small().label("放行 10 秒").disabled(!editable || recovery_failed).on_click(cx.listener(|this, _, _, cx| { if let Some(target) = this.selected.clone() { this.release_target(target, cx); } }))))
+                    .when(selected.is_some_and(|target| self.attempts.iter().any(|attempt| attempt.target.same_identity(target))), |row| row.child(Button::new("retry").small().label("重试").disabled(!editable).on_click(cx.listener(|this, _, _, cx| this.retry_selected(cx)))))
                     .child(Button::new("toggle-protection").primary().small().h(control_height).flex_shrink_0()
                         .icon(if protected { IconName::RotateCcw } else { IconName::ShieldCheck })
                         .label(if recovery_failed { "重试恢复" } else if protected { "解除保护" } else { "开启保护" })
@@ -1260,6 +1793,7 @@ impl Render for KeepWindow {
                             .disabled(!can_protect || recovery_failed).on_click(cx.listener(|this, _, _, cx| this.start_calibration(cx)))))
             ))
             .when(self.rule_settings_open, |config| config.child(div().flex().items_center().gap_3().pt_3().border_t_1().border_color(theme.border)
+                .child(div().w(px(140.)).child(Input::new(&self.rule_name).small()))
                 .child(div().id("title-match-help").flex_1().min_w_0()
                     .tooltip(|window, cx| Tooltip::new("规则按程序路径和窗口类名匹配。标题关键词留空时匹配所有同类窗口。").build(window, cx))
                     .child(Input::new(&self.title_contains).small().h(control_height).aria_label("规则标题关键词").disabled(!editable)))
@@ -1269,6 +1803,25 @@ impl Render for KeepWindow {
                 .child(Button::new("save-rule").small().h(control_height).label("保存规则").tooltip("保存程序、窗口类名、标题条件和当前保护参数")
                     .disabled(!editable || validation_error.is_some() || self.editing_rule.is_none() && selected.is_none_or(|target| self.path_for(target).is_none()))
                     .on_click(cx.listener(|this, _, _, cx| this.save_rule(cx))))))
+            .when(self.rule_settings_open && self.editing_rule.is_some(), |config| config.child(Button::new("save-as-new").small().label("另存为新规则（修改标题条件后）").on_click(cx.listener(|this, _, _, cx| { this.editing_rule = None; this.save_rule(cx); }))))
+            .when_some(selected.map(|target| {
+                let mut detail = format!("{} · PID {} · 0x{:X}", target.display_title(), target.pid, target.hwnd.0 as usize);
+                if let Some(protection) = self.protection_for(target) {
+                    detail.push_str(&format!("\n{}", protection.status().description()));
+                    if protection.options.mouse_shield {
+                        detail.push_str(if protection.calibrating { " · 拦截暂停" } else if window::foreground_matches(target.hwnd) { " · 前台拦截" } else { " · 后台待命" });
+                        if !self.confirmed.iter().any(|item| item.same_identity(target)) { detail.push_str(" · 位置待确认，请校准或确认覆盖位置"); }
+                    }
+                    if self.options(cx).is_ok_and(|options| options != protection.options) { detail.push_str(" · 有未应用修改"); }
+                }
+                let matches: Vec<_> = self.path_for(target).map(|path| self.config.rules.iter().enumerate().filter(|(_, rule)| rule.matches(path, target)).map(|(index, rule)| format!("{}:{}", index + 1, if rule.name.is_empty() { &rule.class } else { &rule.name })).collect()).unwrap_or_default();
+                if !matches.is_empty() {
+                    detail.push_str(&format!("\n匹配规则：{}。带标题条件优先，同类按列表顺序；规则修改仅影响后续匹配。", matches.join("、")));
+                    if let Some((index, _)) = self.path_for(target).and_then(|path| self.config.matching_rule(path, target, false)) { detail.push_str(&format!(" 当前采用第 {} 条。", index + 1)); }
+                }
+                detail
+            }), |config, detail| config.child(div().text_xs().child(detail)))
+            .when(protected && self.mouse_shield, |config| config.child(div().flex().gap_2().items_center().child(div().text_xs().flex_1().child("鼠标遮罩仅拦截覆盖区域；程序退出命令、直接关闭消息和结束进程仍可关闭窗口。" )).child(Button::new("confirm-position").small().label("已确认位置").on_click(cx.listener(|this, _, _, cx| { if let Some(target) = this.selected.clone() { this.confirmed.push(target); } cx.notify(); })))))
             .when_some(self.config_error.clone(), |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)))
             .when_some(validation_error, |config, error| config.child(div().text_xs().text_color(theme.danger).child(error)));
 
@@ -1281,7 +1834,12 @@ impl Render for KeepWindow {
             .overflow_y_scroll()
             .children(self.config.rules.iter().enumerate().map(|(index, rule)| {
                 let label = format!(
-                    "{} · {} · {}",
+                    "{} · {} · {} · {}",
+                    if rule.name.is_empty() {
+                        "未命名"
+                    } else {
+                        &rule.name
+                    },
                     rule.path.rsplit('\\').next().unwrap_or(&rule.path),
                     rule.class,
                     if rule.title_contains.is_empty() {
@@ -1295,6 +1853,32 @@ impl Render for KeepWindow {
                     .items_center()
                     .gap_2()
                     .child(div().flex_1().min_w_0().truncate().text_sm().child(label))
+                    .child(
+                        Button::new(("move-up", index))
+                            .small()
+                            .label("上移")
+                            .disabled(index == 0)
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut config = this.config.clone();
+                                config.rules.swap(index, index - 1);
+                                this.commit_config(config);
+                                this.editing_rule = None;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        Button::new(("move-down", index))
+                            .small()
+                            .label("下移")
+                            .disabled(index + 1 == self.config.rules.len())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                let mut config = this.config.clone();
+                                config.rules.swap(index, index + 1);
+                                this.commit_config(config);
+                                this.editing_rule = None;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         Button::new(("edit-rule", index))
                             .small()
@@ -1325,7 +1909,11 @@ impl Render for KeepWindow {
                             .on_click(cx.listener(move |this, _, _, cx| {
                                 let mut config = this.config.clone();
                                 config.rules.remove(index);
+                                let undo = this.config.rules.clone();
                                 this.commit_config(config);
+                                if this.config.rules.len() < undo.len() {
+                                    this.undo_rules = Some(undo);
+                                }
                                 this.editing_rule = None;
                                 cx.notify();
                             })),
@@ -1363,6 +1951,9 @@ impl Render for KeepWindow {
                     .gap_3()
                     .p_4()
                     .child(toolbar)
+                    .when(self.hotkeys_open, |container| container.child(div().v_flex().gap_2().children(self.hotkey_inputs.iter().enumerate().map(|(index, input)| div().flex().items_center().gap_2().child(div().w(px(180.)).text_sm().child(["切换前台窗口保护", "临时放行前台窗口 10 秒", "解除全部保护"][index])).child(div().flex_1().child(Input::new(input).small())))).child(Button::new("save-hotkeys").small().label("保存快捷键").on_click(cx.listener(|this, _, _, cx| this.save_hotkeys(cx))))))
+                    .when(self.events_open, |container| container.child(div().v_flex().gap_2().child(div().flex().gap_2().child(Checkbox::new("private-diagnostic").label("诊断包含标题、路径与完整错误").checked(self.include_private).on_change(cx.listener(|this, value, _, cx| { this.include_private = *value; cx.notify(); }))).child(Button::new("copy-diagnostic").small().label("复制诊断").on_click(cx.listener(|this, _, _, cx| { cx.write_to_clipboard(gpui_kit::ClipboardItem::new_string(this.diagnostic())); this.status = "诊断信息已复制。".into(); }))).child(Button::new("open-logs").small().label("打开日志目录").on_click(cx.listener(|this, _, _, _| { if let Some(path) = crate::events::directory() { match std::fs::create_dir_all(&path).and_then(|()| std::process::Command::new("explorer.exe").arg(path).spawn().map(|_| ())) { Ok(()) => {}, Err(error) => this.status = error.to_string().into() } } })))).child(div().id("events-list").h(px(120.)).overflow_y_scroll().children(self.events.entries.iter().rev().map(|event| div().text_xs().child(format!("{} [{}] {} ×{}", event.time, event.source, event.detail, event.count))))).when_some(self.events.error.clone(), |panel, error| panel.child(div().text_xs().child(format!("日志写入失败：{error}"))))))
+                    .when(self.rules_open, |container| container.child(div().v_flex().gap_2().child(div().text_xs().child("优先级：带标题条件优先，同类按列表顺序。修改规则不会更改已保护窗口。" )).child(div().flex().gap_2().child(div().flex_1().child(Input::new(&self.transfer_path).small())).child(Button::new("export-rules").small().label("导出").on_click(cx.listener(|this, _, _, cx| this.transfer_rules(false, cx)))).child(Button::new("import-rules").small().label("预览导入").on_click(cx.listener(|this, _, _, cx| this.transfer_rules(true, cx))))).when(self.imported.is_some(), |panel| panel.child(div().flex().gap_2().child(Button::new("keep-existing").small().label("导入：保留已有").on_click(cx.listener(|this, _, _, cx| this.confirm_import(false, cx)))).child(Button::new("overwrite-existing").small().label("导入：覆盖冲突").on_click(cx.listener(|this, _, _, cx| this.confirm_import(true, cx)))).child(Button::new("cancel-import").small().label("取消").on_click(cx.listener(|this, _, _, cx| { this.imported = None; cx.notify(); }))))).when(self.undo_rules.is_some(), |panel| panel.child(Button::new("undo-delete").small().label("撤销删除").on_click(cx.listener(|this, _, _, cx| { if let Some(rules) = this.undo_rules.take() { let mut config = this.config.clone(); config.rules = rules; this.commit_config(config); this.editing_rule = None; } cx.notify(); }))))))
                     .child(if self.rules_open {
                         div()
                             .flex_1()

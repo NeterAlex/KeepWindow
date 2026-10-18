@@ -20,6 +20,11 @@ pub fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(Some(0)).collect()
 }
 
+pub fn foreground_matches(hwnd: HWND) -> bool {
+    use windows::Win32::UI::WindowsAndMessaging::{GA_ROOT, GetAncestor, GetForegroundWindow};
+    unsafe { GetAncestor(GetForegroundWindow(), GA_ROOT) == hwnd }
+}
+
 #[derive(Clone, Debug)]
 pub struct WindowInfo {
     pub hwnd: HWND,
@@ -30,6 +35,13 @@ pub struct WindowInfo {
 }
 
 impl WindowInfo {
+    pub fn auxiliary(&self) -> bool {
+        use windows::Win32::UI::WindowsAndMessaging::{
+            GWL_EXSTYLE, GetWindowLongPtrW, WS_EX_TOOLWINDOW,
+        };
+        self.title.is_empty()
+            || unsafe { GetWindowLongPtrW(self.hwnd, GWL_EXSTYLE) as u32 & WS_EX_TOOLWINDOW.0 != 0 }
+    }
     pub fn inspect(hwnd: HWND) -> Option<Self> {
         unsafe {
             if !IsWindow(Some(hwnd)).as_bool() {

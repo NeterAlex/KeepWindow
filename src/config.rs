@@ -6,6 +6,8 @@ use crate::{protection::Options, storage::atomic_write, window::WindowInfo};
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 pub struct Rule {
+    #[serde(default)]
+    pub name: String,
     pub path: String,
     pub class: String,
     pub title_contains: String,
@@ -36,6 +38,19 @@ pub struct Config {
     pub rules: Vec<Rule>,
     #[serde(default)]
     pub startup_enabled: bool,
+    #[serde(default)]
+    pub hotkeys: [String; 3],
+    #[serde(default)]
+    pub list: ListPreferences,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ListPreferences {
+    pub protected_only: bool,
+    pub grouped: bool,
+    pub show_auxiliary: bool,
+    pub advanced_columns: bool,
 }
 
 impl Default for Config {
@@ -44,6 +59,8 @@ impl Default for Config {
             version: 2,
             rules: Vec::new(),
             startup_enabled: false,
+            hotkeys: Default::default(),
+            list: ListPreferences::default(),
         }
     }
 }
@@ -75,7 +92,7 @@ impl Config {
         }
     }
 
-    fn validate(&self) -> Result<(), String> {
+    pub fn validate(&self) -> Result<(), String> {
         if self.version != 2 {
             return Err(format!(
                 "不支持的配置版本：{}。原文件未修改。",
@@ -115,8 +132,10 @@ impl Store {
                     .map_err(|e| format!("配置读取失败：{e}。原文件未修改。"))
                     .and_then(|mut config| {
                         if config.version == 1 {
+                            if config.version == 1 {
+                                config.startup_enabled = false;
+                            }
                             config.version = 2;
-                            config.startup_enabled = false;
                             config.validate()?;
                             atomic_write(
                                 path,
@@ -177,6 +196,7 @@ mod tests {
     }
     fn rule(title: &str) -> Rule {
         Rule {
+            name: String::new(),
             path: "C:\\Editor.exe".into(),
             class: "Editor".into(),
             title_contains: title.into(),

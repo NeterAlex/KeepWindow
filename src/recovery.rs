@@ -101,6 +101,14 @@ struct Report {
 }
 
 impl Recovery {
+    pub fn can_protect(&self, target: &WindowInfo) -> bool {
+        let journal = self.0.borrow();
+        journal.writable
+            && !journal
+                .records
+                .iter()
+                .any(|record| record.identity.hwnd == target.hwnd.0 as usize as u64)
+    }
     pub fn begin() -> (Self, Option<String>) {
         let path = std::env::var_os("LOCALAPPDATA")
             .map(|root| PathBuf::from(root).join("KeepWindow/recovery.json"));
